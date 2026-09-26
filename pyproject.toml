@@ -1,0 +1,31 @@
+[project]
+name = "vocavault"
+version = "0.1.0"
+requires-python = ">=3.13"
+description = "A local desktop library for virtual singer projects"
+readme = "README.md"
+dependencies = [
+    "PySide6>=6.8,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+]
+
+[project.scripts]
+vocavault = "vocavault.app:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vocavault"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "docs/V0_1_IMPLEMENTATION.md", "pyproject.toml", "uv.lock"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
