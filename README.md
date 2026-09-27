@@ -39,6 +39,3 @@ This is a runnable development build. See
 [implementation and validation notes](docs/V0_1_IMPLEMENTATION.md) for the tested
 format matrix and remaining platform-release gates. Health reflects the last
 import or refresh; refresh after saving a file in an external editor.
-
-The optional user-supplied `example/` corpus is tested when present and is not
-distributed. Synthetic regression tests run on a clean checkout.
