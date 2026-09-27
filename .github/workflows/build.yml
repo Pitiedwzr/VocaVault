@@ -1,0 +1,139 @@
+name: Build Desktop Application (Nuitka)
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            arch: x86_64
+            archive_name: VocaVault-windows-x86_64.zip
+          - os: macos-latest
+            platform: macos
+            arch: arm64
+            archive_name: VocaVault-macos-arm64.zip
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Cache Nuitka compiler cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/Nuitka
+            ~/Library/Caches/Nuitka
+            ~\AppData\Local\Nuitka\Nuitka\Cache
+          key: nuitka-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            nuitka-${{ matrix.platform }}-${{ matrix.arch }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . nuitka zstandard
+
+      - name: Build with Nuitka (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -m nuitka `
+            --standalone `
+            --assume-yes-for-downloads `
+            --enable-plugin=pyside6 `
+            --windows-console-mode=disable `
+            --output-dir=dist `
+            --output-folder-name=VocaVault `
+            --output-filename=VocaVault.exe `
+            --include-package=vocavault `
+            --python-flag=-m `
+            vocavault
+
+          if (-not (Test-Path "dist/VocaVault.dist/VocaVault.exe")) {
+            Write-Error "Windows binary dist/VocaVault.dist/VocaVault.exe was not created."
+            exit 1
+          }
+
+          Rename-Item -Path "dist/VocaVault.dist" -NewName "VocaVault"
+          Compress-Archive -Path "dist/VocaVault" -DestinationPath "dist/${{ matrix.archive_name }}"
+
+      - name: Build with Nuitka (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          python -m nuitka \
+            --standalone \
+            --assume-yes-for-downloads \
+            --enable-plugin=pyside6 \
+            --macos-create-app-bundle \
+            --macos-app-name=VocaVault \
+            --output-dir=dist \
+            --output-folder-name=VocaVault \
+            --include-package=vocavault \
+            --python-flag=-m \
+            vocavault
+
+          if [ ! -d "dist/VocaVault.app" ]; then
+            echo "macOS application bundle dist/VocaVault.app was not created."
+            exit 1
+          fi
+
+          cd dist
+          ditto -c -k --keepParent VocaVault.app "${{ matrix.archive_name }}"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/${{ matrix.archive_name }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Display downloaded files
+        run: ls -lh artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
