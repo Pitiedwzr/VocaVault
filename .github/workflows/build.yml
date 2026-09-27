@@ -73,7 +73,7 @@ jobs:
             --output-filename=VocaVault.exe `
             --include-package=vocavault `
             --python-flag=-m `
-            vocavault
+            src/vocavault
 
           if (-not (Test-Path "dist/VocaVault.dist/VocaVault.exe")) {
             Write-Error "Windows binary dist/VocaVault.dist/VocaVault.exe was not created."
@@ -96,7 +96,7 @@ jobs:
             --output-folder-name=VocaVault \
             --include-package=vocavault \
             --python-flag=-m \
-            vocavault
+            src/vocavault
 
           if [ ! -d "dist/VocaVault.app" ]; then
             echo "macOS application bundle dist/VocaVault.app was not created."
