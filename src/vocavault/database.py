@@ -67,6 +67,7 @@ _REQUIRED_TABLES_V2 = frozenset(
         "api_cache",
     }
 )
+_REQUIRED_TABLES_V3 = _REQUIRED_TABLES_V2
 _REQUIRED_SCHEMA_OBJECTS = {
     1: {
         "table": _REQUIRED_TABLES_V1,
@@ -74,6 +75,10 @@ _REQUIRED_SCHEMA_OBJECTS = {
     },
     2: {
         "table": _REQUIRED_TABLES_V2,
+        "trigger": _REQUIRED_TRIGGERS_V1,
+    },
+    3: {
+        "table": _REQUIRED_TABLES_V3,
         "trigger": _REQUIRED_TRIGGERS_V1,
     },
 }
@@ -576,6 +581,12 @@ _MIGRATIONS: tuple[Migration, ...] = (
             CREATE INDEX api_cache_lookup
                 ON api_cache(endpoint, query_or_id)
             """,
+        ),
+    ),
+    Migration(
+        3,
+        (
+            "ALTER TABLE versions ADD COLUMN distribution_terms TEXT",
         ),
     ),
 )

@@ -724,6 +724,9 @@ class LibraryService:
                        p.song_id, p.preferred_version_id,
                        ws.id AS status_id, ws.name AS status_name,
                        v.id AS version_id, v.label AS version_label,
+                       v.sort_order AS version_sort_order, v.notes AS version_notes,
+                       v.distribution_terms AS version_distribution_terms,
+                       v.default_file_id AS version_default_file_id,
                        f.id AS file_id, f.locator, f.is_present, f.detected_format,
                        f.detected_version, f.content_hash,
                        o.status AS parse_status, o.is_stale, o.initial_bpm,
@@ -927,6 +930,7 @@ class LibraryService:
                     "project_id": project_id,
                     "name": row["project_name"],
                     "description": row["description"] or "",
+                    "preferred_version_id": row["preferred_version_id"],
                     "status_id": row["status_id"],
                     "status_name": row["status_name"],
                     "aliases": metadata.get("aliases", []),
@@ -950,12 +954,28 @@ class LibraryService:
                 project["match_rank"] = match_rank(best_match)
                 project["match_field"] = best_match[1]
                 project["match_value"] = best_match[2]
+            v_entry = {
+                "id": row["version_id"],
+                "label": row["version_label"],
+                "sort_order": row["version_sort_order"],
+                "notes": row["version_notes"] or "",
+                "distribution_terms": row["version_distribution_terms"] or "",
+                "default_file_id": row["version_default_file_id"],
+                "is_preferred": row["version_id"] == row["preferred_version_id"],
+            }
+            if v_entry not in project.setdefault("versions", []):
+                project["versions"].append(v_entry)
             project["files"].append(
                 {
                     "id": row["file_id"],
                     "file_id": row["file_id"],
                     "version_id": row["version_id"],
                     "version_label": row["version_label"],
+                    "version_sort_order": row["version_sort_order"],
+                    "version_notes": row["version_notes"] or "",
+                    "version_terms": row["version_distribution_terms"] or "",
+                    "is_preferred_version": row["version_id"] == row["preferred_version_id"],
+                    "is_default_file": row["file_id"] == row["version_default_file_id"],
                     "path": row["locator"],
                     "locator": row["locator"],
                     "format_name": row["detected_format"],
@@ -1838,6 +1858,397 @@ class LibraryService:
         if candidate is None:
             raise LibraryError(f"VocaDB entry #{vocadb_id} could not be retrieved.")
         return self.apply_vocadb_enrichment(project_id, candidate)
+
+
+    @_serialized_write
+    def create_version(
+        self, project_id: str, label: str, *, notes: str = "", terms: str = ""
+    ) -> dict[str, Any]:
+        clean_label = label.strip()
+        if not clean_label:
+            raise LibraryError("Version label cannot be empty.")
+        with self.database.connection() as connection, transaction(connection):
+            proj = connection.execute(
+                "SELECT id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if proj is None:
+                raise LibraryError(f"Project {project_id} does not exist.")
+            version_id = new_id()
+            max_order_row = connection.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM versions WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            sort_order = max_order_row[0] if max_order_row else 0
+            connection.execute(
+                """
+                INSERT INTO versions(id, project_id, label, normalized_label, sort_order, notes, distribution_terms)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    version_id,
+                    project_id,
+                    clean_label,
+                    normalize_search_text(clean_label),
+                    sort_order,
+                    notes,
+                    terms,
+                ),
+            )
+            return {
+                "id": version_id,
+                "project_id": project_id,
+                "label": clean_label,
+                "sort_order": sort_order,
+                "notes": notes,
+                "distribution_terms": terms,
+            }
+
+    def list_versions(self, project_id: str) -> list[dict[str, Any]]:
+        with self.database.connection(readonly=True) as connection:
+            rows = connection.execute(
+                """
+                SELECT v.id, v.project_id, v.label, v.sort_order, v.notes,
+                       v.distribution_terms, v.default_file_id, v.created_at, v.updated_at,
+                       p.preferred_version_id
+                  FROM versions v
+                  JOIN projects p ON p.id = v.project_id
+                 WHERE v.project_id = ?
+                 ORDER BY v.sort_order, v.created_at
+                """,
+                (project_id,),
+            ).fetchall()
+            return [
+                {
+                    "id": row["id"],
+                    "project_id": row["project_id"],
+                    "label": row["label"],
+                    "sort_order": row["sort_order"],
+                    "notes": row["notes"] or "",
+                    "distribution_terms": row["distribution_terms"] or "",
+                    "default_file_id": row["default_file_id"],
+                    "is_preferred": row["id"] == row["preferred_version_id"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in rows
+            ]
+
+    @_serialized_write
+    def update_version(
+        self,
+        version_id: str,
+        *,
+        label: str | None = None,
+        notes: str | None = None,
+        distribution_terms: str | None = None,
+    ) -> dict[str, Any]:
+        with self.database.connection() as connection, transaction(connection):
+            ver = connection.execute(
+                "SELECT id, project_id, label, notes, distribution_terms, sort_order FROM versions WHERE id = ?",
+                (version_id,),
+            ).fetchone()
+            if ver is None:
+                raise LibraryError(f"Version {version_id} does not exist.")
+
+            new_label = ver["label"] if label is None else label.strip()
+            if not new_label:
+                raise LibraryError("Version label cannot be empty.")
+            new_notes = ver["notes"] if notes is None else notes
+            new_terms = ver["distribution_terms"] if distribution_terms is None else distribution_terms
+
+            connection.execute(
+                """
+                UPDATE versions
+                   SET label = ?, normalized_label = ?, notes = ?, distribution_terms = ?,
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?
+                """,
+                (new_label, normalize_search_text(new_label), new_notes, new_terms, version_id),
+            )
+            return {
+                "id": version_id,
+                "project_id": ver["project_id"],
+                "label": new_label,
+                "notes": new_notes or "",
+                "distribution_terms": new_terms or "",
+                "sort_order": ver["sort_order"],
+            }
+
+    @_serialized_write
+    def delete_version(self, version_id: str) -> None:
+        with self.database.connection() as connection, transaction(connection):
+            ver_row = connection.execute(
+                "SELECT project_id FROM versions WHERE id = ?", (version_id,)
+            ).fetchone()
+            if ver_row is None:
+                raise LibraryError(f"Version {version_id} does not exist.")
+            project_id = ver_row[0]
+            ver_count = connection.execute(
+                "SELECT COUNT(*) FROM versions WHERE project_id = ?", (project_id,)
+            ).fetchone()[0]
+            if ver_count <= 1:
+                raise LibraryError("Cannot delete the only version of a project.")
+
+            proj = connection.execute(
+                "SELECT preferred_version_id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if proj and proj[0] == version_id:
+                other_ver = connection.execute(
+                    "SELECT id FROM versions WHERE project_id = ? AND id != ? ORDER BY sort_order LIMIT 1",
+                    (project_id, version_id),
+                ).fetchone()
+                new_pref = other_ver[0] if other_ver else None
+                connection.execute(
+                    "UPDATE projects SET preferred_version_id = ? WHERE id = ?",
+                    (new_pref, project_id),
+                )
+
+            connection.execute("DELETE FROM versions WHERE id = ?", (version_id,))
+        self.rebuild_search_index()
+
+    @_serialized_write
+    def set_preferred_version(self, project_id: str, version_id: str) -> None:
+        with self.database.connection() as connection, transaction(connection):
+            ver = connection.execute(
+                "SELECT id FROM versions WHERE id = ? AND project_id = ?",
+                (version_id, project_id),
+            ).fetchone()
+            if ver is None:
+                raise LibraryError("Version does not belong to this project.")
+            connection.execute(
+                "UPDATE projects SET preferred_version_id = ? WHERE id = ?",
+                (version_id, project_id),
+            )
+
+    @_serialized_write
+    def set_default_file(self, version_id: str, file_id: str) -> None:
+        with self.database.connection() as connection, transaction(connection):
+            f = connection.execute(
+                "SELECT id FROM files WHERE id = ? AND version_id = ?",
+                (file_id, version_id),
+            ).fetchone()
+            if f is None:
+                raise LibraryError("File does not belong to this version.")
+            connection.execute(
+                "UPDATE versions SET default_file_id = ? WHERE id = ?",
+                (file_id, version_id),
+            )
+
+    @_serialized_write
+    def move_file_to_version(self, file_id: str, target_version_id: str) -> None:
+        with self.database.connection() as connection, transaction(connection):
+            file_row = connection.execute(
+                "SELECT version_id FROM files WHERE id = ?", (file_id,)
+            ).fetchone()
+            if file_row is None:
+                raise LibraryError(f"File {file_id} does not exist.")
+            old_version_id = file_row[0]
+            if old_version_id == target_version_id:
+                return
+
+            target_row = connection.execute(
+                "SELECT id, default_file_id FROM versions WHERE id = ?",
+                (target_version_id,),
+            ).fetchone()
+            if target_row is None:
+                raise LibraryError(f"Target version {target_version_id} does not exist.")
+
+            old_version = connection.execute(
+                "SELECT default_file_id FROM versions WHERE id = ?", (old_version_id,)
+            ).fetchone()
+            if old_version and old_version[0] == file_id:
+                other_file = connection.execute(
+                    "SELECT id FROM files WHERE version_id = ? AND id != ? LIMIT 1",
+                    (old_version_id, file_id),
+                ).fetchone()
+                new_default = other_file[0] if other_file else None
+                connection.execute(
+                    "UPDATE versions SET default_file_id = ? WHERE id = ?",
+                    (new_default, old_version_id),
+                )
+
+            connection.execute(
+                "UPDATE files SET version_id = ? WHERE id = ?",
+                (target_version_id, file_id),
+            )
+
+            if target_row[1] is None:
+                connection.execute(
+                    "UPDATE versions SET default_file_id = ? WHERE id = ?",
+                    (file_id, target_version_id),
+                )
+        self.rebuild_search_index()
+
+    @_serialized_write
+    def move_version_to_project(self, version_id: str, target_project_id: str) -> None:
+        with self.database.connection() as connection, transaction(connection):
+            ver_row = connection.execute(
+                "SELECT project_id FROM versions WHERE id = ?", (version_id,)
+            ).fetchone()
+            if ver_row is None:
+                raise LibraryError(f"Version {version_id} does not exist.")
+            old_project_id = ver_row[0]
+            if old_project_id == target_project_id:
+                return
+
+            target_proj = connection.execute(
+                "SELECT id, preferred_version_id FROM projects WHERE id = ?",
+                (target_project_id,),
+            ).fetchone()
+            if target_proj is None:
+                raise LibraryError(f"Target project {target_project_id} does not exist.")
+
+            old_proj = connection.execute(
+                "SELECT preferred_version_id FROM projects WHERE id = ?",
+                (old_project_id,),
+            ).fetchone()
+            if old_proj and old_proj[0] == version_id:
+                other_ver = connection.execute(
+                    "SELECT id FROM versions WHERE project_id = ? AND id != ? ORDER BY sort_order LIMIT 1",
+                    (old_project_id, version_id),
+                ).fetchone()
+                new_pref = other_ver[0] if other_ver else None
+                connection.execute(
+                    "UPDATE projects SET preferred_version_id = ? WHERE id = ?",
+                    (new_pref, old_project_id),
+                )
+
+            max_order_row = connection.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM versions WHERE project_id = ?",
+                (target_project_id,),
+            ).fetchone()
+            new_sort_order = max_order_row[0] if max_order_row else 0
+
+            connection.execute(
+                "UPDATE versions SET sort_order = ?, project_id = ? WHERE id = ?",
+                (new_sort_order, target_project_id, version_id),
+            )
+
+            if target_proj[1] is None:
+                connection.execute(
+                    "UPDATE projects SET preferred_version_id = ? WHERE id = ?",
+                    (version_id, target_project_id),
+                )
+        self.rebuild_search_index()
+
+    @_serialized_write
+    def group_projects(self, source_project_id: str, target_project_id: str) -> None:
+        if source_project_id == target_project_id:
+            return
+        with self.database.connection() as connection, transaction(connection):
+            src = connection.execute(
+                "SELECT id, song_id, description FROM projects WHERE id = ?", (source_project_id,)
+            ).fetchone()
+            tgt = connection.execute(
+                "SELECT id, song_id, description FROM projects WHERE id = ?", (target_project_id,)
+            ).fetchone()
+            if not src or not tgt:
+                raise LibraryError("Source or target project does not exist.")
+
+            # Unset preferred_version_id on source project before reparenting
+            connection.execute(
+                "UPDATE projects SET preferred_version_id = NULL WHERE id = ?",
+                (source_project_id,),
+            )
+
+            # Re-index incoming versions to avoid UNIQUE (project_id, sort_order) conflicts
+            max_order_row = connection.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM versions WHERE project_id = ?",
+                (target_project_id,),
+            ).fetchone()
+            base_order = max_order_row[0] if max_order_row else 0
+
+            source_versions = connection.execute(
+                "SELECT id FROM versions WHERE project_id = ? ORDER BY sort_order",
+                (source_project_id,),
+            ).fetchall()
+            for idx, (ver_id,) in enumerate(source_versions):
+                connection.execute(
+                    "UPDATE versions SET sort_order = ?, project_id = ? WHERE id = ?",
+                    (base_order + idx, target_project_id, ver_id),
+                )
+
+            # Preserve song association if target does not have one
+            if tgt["song_id"] is None and src["song_id"] is not None:
+                connection.execute(
+                    "UPDATE projects SET song_id = ? WHERE id = ?",
+                    (src["song_id"], target_project_id),
+                )
+
+            # Preserve description if target does not have one
+            if not tgt["description"] and src["description"]:
+                connection.execute(
+                    "UPDATE projects SET description = ? WHERE id = ?",
+                    (src["description"], target_project_id),
+                )
+
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO project_tags(project_id, tag_id)
+                SELECT ?, tag_id FROM project_tags WHERE project_id = ?
+                """,
+                (target_project_id, source_project_id),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO project_credits(id, project_id, contributor_id, role, source_type, source_identifier)
+                SELECT lower(hex(randomblob(16))), ?, contributor_id, role, source_type, source_identifier
+                  FROM project_credits WHERE project_id = ?
+                """,
+                (target_project_id, source_project_id),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO project_links(id, project_id, kind, url, label)
+                SELECT lower(hex(randomblob(16))), ?, kind, url, label
+                  FROM project_links WHERE project_id = ?
+                """,
+                (target_project_id, source_project_id),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO project_overrides(project_id, field_name, value_text, intentionally_cleared)
+                SELECT ?, field_name, value_text, intentionally_cleared
+                  FROM project_overrides WHERE project_id = ?
+                """,
+                (target_project_id, source_project_id),
+            )
+            connection.execute(
+                "DELETE FROM projects WHERE id = ?", (source_project_id,)
+            )
+
+        self.rebuild_search_index()
+
+    def open_project(
+        self, project_id: str, application: str | Path | None = None
+    ) -> None:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT v.default_file_id
+                  FROM projects p
+                  JOIN versions v ON v.id = p.preferred_version_id
+                 WHERE p.id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+            file_id = row[0] if row and row[0] else None
+            if not file_id:
+                fallback = connection.execute(
+                    """
+                    SELECT f.id FROM files f
+                      JOIN versions v ON v.id = f.version_id
+                     WHERE v.project_id = ?
+                     ORDER BY v.sort_order, f.role = 'project' DESC
+                     LIMIT 1
+                    """,
+                    (project_id,),
+                ).fetchone()
+                if not fallback:
+                    raise LibraryError("Project has no files to open.")
+                file_id = fallback[0]
+
+        self.open_file(file_id, application)
 
     def export_metadata(self, destination: str | Path) -> Path:
         """Write a portable JSON metadata snapshot without any project bytes."""
