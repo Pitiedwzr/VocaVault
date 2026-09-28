@@ -526,7 +526,7 @@ class VocaDbDialog(QDialog):
     def _apply_enrichment(self) -> None:
         if not self.selected_candidate:
             return
-        project_id = self.project["id"]
+        project_id = _text(_value(self.project, "id", "project_id"))
         try:
             self.library.apply_vocadb_enrichment(
                 project_id,
@@ -535,6 +535,7 @@ class VocaDbDialog(QDialog):
                 apply_aliases=self.aliases_check.isChecked(),
                 apply_credits=self.credits_check.isChecked(),
                 apply_links=self.links_check.isChecked(),
+                overwrite_overrides=True,
             )
             self.accept()
         except Exception as exc:
@@ -1212,9 +1213,9 @@ class MainWindow(QMainWindow):
                 _value(project, "status_name", "status_id", "status", "workflow_status")
             )
         )
-        aliases = _value(project, "editable_aliases", default=[])
+        aliases = _value(project, "editable_aliases") or _value(project, "aliases", default=[])
         self.aliases_edit.setPlainText("\n".join(_text(alias) for alias in aliases))
-        credit_records = _value(project, "editable_credit_records", default=[])
+        credit_records = _value(project, "editable_credit_records") or _value(project, "credit_records", default=[])
         if credit_records:
             credit_lines = [
                 f"{_text(_value(item, 'role'))}: {_text(_value(item, 'name'))}"
@@ -1276,6 +1277,7 @@ class MainWindow(QMainWindow):
 
         aliases = _value(project, "aliases", "song_names")
         credits = _value(project, "credits", "contributors")
+        links = _value(project, "links")
         tags = _value(project, "tags")
         match_field = _value(project, "match_field")
         match_value = _value(project, "match_value")
@@ -1286,6 +1288,8 @@ class MainWindow(QMainWindow):
             details.append(f"Aliases: {_text(aliases)}")
         if credits:
             details.append(f"Credits: {_text(credits)}")
+        if links:
+            details.append(f"Links: {_text(links)}")
         if tags:
             details.append(f"Tags: {_text(tags)}")
         self.metadata_details.setText("\n".join(details))
@@ -1463,8 +1467,9 @@ class MainWindow(QMainWindow):
             return
         dlg = VocaDbDialog(self.library, self._selected_project, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            project_id = _text(_value(self._selected_project, "id"))
+            project_id = _text(_value(self._selected_project, "id", "project_id"))
             self.reload_projects(project_id)
+            self.statusBar().showMessage("VocaDB metadata applied.", 3000)
 
     @Slot()
     def refresh_selected_vocadb(self) -> None:

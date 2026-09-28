@@ -144,3 +144,57 @@ def test_main_window_version_and_grouping_integration(tmp_path: Path, app_instan
     app_instance.processEvents()
     window.close()
     app_instance.processEvents()
+
+
+def test_main_window_vocadb_enrichment_flow(tmp_path: Path, app_instance: QApplication) -> None:
+    library = LibraryService(tmp_path / "ui_vocadb_e2e.sqlite3")
+    f1 = tmp_path / "ghost.svp"
+    f1.write_bytes(b'{"version": 113, "time": {}, "tracks": []}')
+    library.import_paths([f1])
+
+    window = MainWindow(library)
+    window.thread_pool.waitForDone()
+    app_instance.processEvents()
+
+    assert window.project_table.rowCount() == 1
+    assert window.project_table.item(0, 0).text() == "ghost"
+    assert window.name_edit.text() == "ghost"
+
+    mock_cand = VocaDbCandidate(
+        id=12345,
+        name="ゴーストルール",
+        artist_string="DECO*27 feat. 初音ミク",
+        song_type="Original",
+        names=({"value": "Ghost Rule", "language": "English"},),
+        artists=({"name": "DECO*27", "roles": "Composer"},),
+        links=({"kind": "youtube", "url": "https://youtube.com/watch?v=xxx", "label": "YouTube"},),
+    )
+
+    with mock.patch.object(library, "search_vocadb_candidates", return_value=[mock_cand]):
+        # Simulate user triggering enrichment dialog and clicking apply
+        dlg = VocaDbDialog(library, window._selected_project, window)
+        dlg.candidates_table.selectRow(0)
+        dlg._apply_enrichment()
+        assert dlg.result() == VocaDbDialog.DialogCode.Accepted
+
+        # Notify main window as done in enrich_selected_with_vocadb
+        project_id = window.project_table.item(0, 0).data(Qt.ItemDataRole.UserRole)
+        window.reload_projects(project_id)
+        window.thread_pool.waitForDone()
+        app_instance.processEvents()
+
+    # The project name must now be enriched!
+    assert window.project_table.item(0, 0).text() == "ゴーストルール"
+    assert window.name_edit.text() == "ゴーストルール"
+
+    # Aliases and credits must now appear in the inspector
+    assert "Ghost Rule" in window.aliases_edit.toPlainText()
+    assert "Composer: DECO*27" in window.credits_edit.toPlainText()
+    assert "Linked to VocaDB #12345" in window.vocadb_status.text()
+    assert "YouTube: https://youtube.com/watch?v=xxx" in window.metadata_details.text()
+
+    window.thread_pool.waitForDone()
+    app_instance.processEvents()
+    window.close()
+    app_instance.processEvents()
+

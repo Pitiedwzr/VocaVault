@@ -944,6 +944,8 @@ class LibraryService:
                         "editable_credit_records", []
                     ),
                     "tags": metadata.get("tags", []),
+                    "links": metadata.get("links", []),
+                    "link_records": metadata.get("link_records", []),
                     "files": [],
                     "match_rank": match_rank(best_match) if best_match else None,
                     "match_field": best_match[1] if best_match else None,
@@ -1043,6 +1045,8 @@ class LibraryService:
                 "normalized_credits": [],
                 "tags": [],
                 "normalized_tags": [],
+                "links": [],
+                "link_records": [],
             }
 
         result = {
@@ -1059,26 +1063,40 @@ class LibraryService:
         ).fetchall()
         for item in aliases:
             data = result[item["project_id"]]
-            data["aliases"].append(item["text"])
-            data["normalized_aliases"].append(item["normalized_text"])
-            if item["source_type"] == "user":
+            if item["text"] not in data["aliases"]:
+                data["aliases"].append(item["text"])
+            if item["normalized_text"] not in data["normalized_aliases"]:
+                data["normalized_aliases"].append(item["normalized_text"])
+            if item["text"] not in data["editable_aliases"]:
                 data["editable_aliases"].append(item["text"])
 
         credits = connection.execute(
             """
-            SELECT pc.project_id, c.display_name, c.normalized_name,
+            SELECT p.id AS project_id, c.display_name, c.normalized_name,
                    pc.role, pc.source_type
-              FROM project_credits pc JOIN contributors c ON c.id = pc.contributor_id
-             ORDER BY pc.project_id, c.normalized_name, pc.role, pc.id
+              FROM projects p
+              JOIN project_credits pc ON pc.project_id = p.id
+              JOIN contributors c ON c.id = pc.contributor_id
+            UNION
+            SELECT p.id AS project_id, c.display_name, c.normalized_name,
+                   sc.role, sc.source_type
+              FROM projects p
+              JOIN song_credits sc ON sc.song_id = p.song_id
+              JOIN contributors c ON c.id = sc.contributor_id
+             ORDER BY 1, 3, 4
             """
         ).fetchall()
         for item in credits:
             data = result[item["project_id"]]
-            data["credits"].append(f"{item['display_name']} ({item['role']})")
+            credit_str = f"{item['display_name']} ({item['role']})"
+            if credit_str not in data["credits"]:
+                data["credits"].append(credit_str)
             record = {"name": item["display_name"], "role": item["role"]}
-            data["credit_records"].append(record)
-            data["normalized_credits"].append(item["normalized_name"])
-            if item["source_type"] == "user":
+            if record not in data["credit_records"]:
+                data["credit_records"].append(record)
+            if item["normalized_name"] not in data["normalized_credits"]:
+                data["normalized_credits"].append(item["normalized_name"])
+            if record not in data["editable_credit_records"]:
                 data["editable_credit_records"].append(record)
 
         contributor_aliases = connection.execute(
@@ -1087,11 +1105,39 @@ class LibraryService:
               FROM project_credits pc
               JOIN contributor_names cn ON cn.contributor_id = pc.contributor_id
              WHERE cn.is_dismissed = 0
+            UNION
+            SELECT p.id AS project_id, cn.normalized_text
+              FROM projects p
+              JOIN song_credits sc ON sc.song_id = p.song_id
+              JOIN contributor_names cn ON cn.contributor_id = sc.contributor_id
+             WHERE cn.is_dismissed = 0
             """
         ).fetchall()
         for item in contributor_aliases:
-            result[item["project_id"]]["normalized_credits"].append(
-                item["normalized_text"]
+            if item["normalized_text"] not in result[item["project_id"]]["normalized_credits"]:
+                result[item["project_id"]]["normalized_credits"].append(
+                    item["normalized_text"]
+                )
+
+        links = connection.execute(
+            """
+            SELECT p.id AS project_id, sl.kind, sl.url, sl.label
+              FROM projects p
+              JOIN song_links sl ON sl.song_id = p.song_id
+            UNION
+            SELECT pl.project_id, pl.kind, pl.url, pl.label
+              FROM project_links pl
+             ORDER BY 1, 4, 3
+            """
+        ).fetchall()
+        for item in links:
+            data = result[item["project_id"]]
+            label = item["label"] or item["kind"] or "Link"
+            link_str = f"{label}: {item['url']}"
+            if link_str not in data["links"]:
+                data["links"].append(link_str)
+            data["link_records"].append(
+                {"kind": item["kind"], "url": item["url"], "label": item["label"]}
             )
 
         tags = connection.execute(
@@ -1354,6 +1400,20 @@ class LibraryService:
             self._set_aliases(connection, project_id, alias_values)
             self._set_credits(connection, project_id, credit_values)
             self._set_tags(connection, project_id, tag_values)
+            proj_song = connection.execute(
+                "SELECT song_id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if proj_song and proj_song["song_id"]:
+                connection.execute(
+                    """
+                    INSERT INTO song_overrides(song_id, field_name, value_text, updated_at)
+                    VALUES (?, 'display_name', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    ON CONFLICT(song_id, field_name) DO UPDATE SET
+                        value_text = excluded.value_text,
+                        updated_at = excluded.updated_at
+                    """,
+                    (proj_song["song_id"], name),
+                )
 
     @staticmethod
     def _alias_values(aliases: Iterable[str]) -> list[tuple[str, str]]:
@@ -1412,8 +1472,25 @@ class LibraryService:
             if row["text"] not in desired:
                 connection.execute("DELETE FROM song_names WHERE id = ?", (row["id"],))
 
+        other_rows = connection.execute(
+            "SELECT id, text, is_dismissed FROM song_names WHERE song_id = ? AND source_type != 'user'",
+            (song_id,),
+        ).fetchall()
+        for r in other_rows:
+            if r["text"] not in desired and not r["is_dismissed"]:
+                connection.execute(
+                    "UPDATE song_names SET is_dismissed = 1 WHERE id = ?", (r["id"],)
+                )
+            elif r["text"] in desired and r["is_dismissed"]:
+                connection.execute(
+                    "UPDATE song_names SET is_dismissed = 0 WHERE id = ?", (r["id"],)
+                )
+
         desired_ids: list[str] = []
+        vocadb_texts = {r["text"] for r in other_rows}
         for normalized, text in values:
+            if text in vocadb_texts:
+                continue
             row = existing.get(text)
             if row is not None:
                 desired_ids.append(row["id"])
@@ -1455,6 +1532,23 @@ class LibraryService:
             is None
         ):
             raise LibraryError("The selected project is no longer registered.")
+        song_row = connection.execute(
+            "SELECT song_id FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        song_id = song_row["song_id"] if song_row else None
+        song_existing: set[tuple[str, str]] = set()
+        if song_id:
+            for r in connection.execute(
+                """
+                SELECT sc.role, c.display_name
+                  FROM song_credits sc
+                  JOIN contributors c ON c.id = sc.contributor_id
+                 WHERE sc.song_id = ?
+                """,
+                (song_id,),
+            ).fetchall():
+                song_existing.add((r["role"], r["display_name"]))
+
         existing_rows = connection.execute(
             """
             SELECT pc.id, pc.role, pc.contributor_id, c.display_name
@@ -1469,6 +1563,8 @@ class LibraryService:
         for row in existing_rows:
             existing.setdefault((row["role"], row["display_name"]), []).append(row)
         for role, name, normalized in values:
+            if (role, name) in song_existing:
+                continue
             candidates = existing.get((role, name), [])
             if candidates:
                 candidates.pop(0)
@@ -1590,6 +1686,7 @@ class LibraryService:
                 SELECT p.id, sn.id, 'song alias', sn.text, sn.normalized_text
                   FROM projects p
                   JOIN song_names sn ON sn.song_id = p.song_id
+                 WHERE sn.is_dismissed = 0
                 """
             )
             connection.execute(
@@ -1599,6 +1696,11 @@ class LibraryService:
                   FROM projects p
                   JOIN project_credits pc ON pc.project_id = p.id
                   JOIN contributors c ON c.id = pc.contributor_id
+                UNION
+                SELECT p.id, c.id, 'credit', c.display_name, c.normalized_name
+                  FROM projects p
+                  JOIN song_credits sc ON sc.song_id = p.song_id
+                  JOIN contributors c ON c.id = sc.contributor_id
                 """
             )
             connection.execute(
@@ -1608,6 +1710,13 @@ class LibraryService:
                   FROM projects p
                   JOIN project_credits pc ON pc.project_id = p.id
                   JOIN contributor_names cn ON cn.contributor_id = pc.contributor_id
+                 WHERE cn.is_dismissed = 0
+                UNION
+                SELECT p.id, cn.id, 'contributor alias', cn.text, cn.normalized_text
+                  FROM projects p
+                  JOIN song_credits sc ON sc.song_id = p.song_id
+                  JOIN contributor_names cn ON cn.contributor_id = sc.contributor_id
+                 WHERE cn.is_dismissed = 0
                 """
             )
             connection.execute(
@@ -1689,7 +1798,24 @@ class LibraryService:
         apply_aliases: bool = True,
         apply_credits: bool = True,
         apply_links: bool = True,
+        overwrite_overrides: bool = True,
     ) -> dict[str, Any]:
+        if "links" not in candidate_data and (
+            "pvs" in candidate_data or "webLinks" in candidate_data
+        ):
+            from .vocadb import VocaDbCandidate
+
+            cand_obj = VocaDbCandidate.from_api_dict(candidate_data)
+            candidate_data = {
+                "id": cand_obj.id,
+                "name": cand_obj.name,
+                "artist_string": cand_obj.artist_string,
+                "song_type": cand_obj.song_type,
+                "publish_date": cand_obj.publish_date,
+                "names": list(cand_obj.names),
+                "artists": list(cand_obj.artists),
+                "links": list(cand_obj.links),
+            }
         vocadb_id = int(candidate_data["id"])
         with self.database.connection() as connection, transaction(connection):
             row = connection.execute(
@@ -1714,11 +1840,18 @@ class LibraryService:
                     (vocadb_id, song_id),
                 )
 
-            # Check if name is manually overridden
-            overridden_name = connection.execute(
-                "SELECT value_text FROM song_overrides WHERE song_id = ? AND field_name = 'display_name'",
-                (song_id,),
-            ).fetchone()
+            if overwrite_overrides:
+                connection.execute(
+                    "DELETE FROM song_overrides WHERE song_id = ? AND field_name = 'display_name'",
+                    (song_id,),
+                )
+                overridden_name = None
+            else:
+                # Check if name is manually overridden
+                overridden_name = connection.execute(
+                    "SELECT value_text FROM song_overrides WHERE song_id = ? AND field_name = 'display_name'",
+                    (song_id,),
+                ).fetchone()
 
             if apply_name and not overridden_name:
                 cand_name = str(candidate_data.get("name", "")).strip()
@@ -1740,6 +1873,15 @@ class LibraryService:
                             """,
                             (new_id(), song_id, cand_name, normalize_search_text(cand_name), str(vocadb_id)),
                         )
+                    connection.execute(
+                        """
+                        UPDATE projects
+                           SET name = ?, normalized_name = ?,
+                               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                         WHERE song_id = ?
+                        """,
+                        (cand_name, normalize_search_text(cand_name), song_id),
+                    )
 
             if apply_aliases:
                 existing_aliases = {
@@ -1761,6 +1903,11 @@ class LibraryService:
                             (new_id(), song_id, alias_val, norm_val, n.get("language"), str(vocadb_id)),
                         )
                         existing_aliases.add(norm_val)
+                    elif alias_val and norm_val in existing_aliases and overwrite_overrides:
+                        connection.execute(
+                            "UPDATE song_names SET is_dismissed = 0 WHERE song_id = ? AND normalized_text = ?",
+                            (song_id, norm_val),
+                        )
 
             if apply_credits:
                 existing_credits = {
@@ -1860,7 +2007,9 @@ class LibraryService:
         candidate = self.fetch_vocadb_candidate(vocadb_id)
         if candidate is None:
             raise LibraryError(f"VocaDB entry #{vocadb_id} could not be retrieved.")
-        return self.apply_vocadb_enrichment(project_id, candidate)
+        return self.apply_vocadb_enrichment(
+            project_id, candidate, overwrite_overrides=False
+        )
 
 
     @_serialized_write
