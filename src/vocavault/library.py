@@ -1616,6 +1616,229 @@ class LibraryService:
                 """
             )
 
+
+    def search_vocadb_candidates(
+        self, query: str, *, max_results: int = 10
+    ) -> list[dict[str, Any]]:
+        from .vocadb import VocaDbClient
+        with self.database.connection() as conn:
+            client = VocaDbClient(cache_connection=conn)
+            candidates = client.search_songs(query, max_results=max_results)
+            return [
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "artist_string": c.artist_string,
+                    "song_type": c.song_type,
+                    "publish_date": c.publish_date,
+                    "names": list(c.names),
+                    "artists": list(c.artists),
+                    "links": list(c.links),
+                }
+                for c in candidates
+            ]
+
+    def fetch_vocadb_candidate(self, song_id: int) -> dict[str, Any] | None:
+        from .vocadb import VocaDbClient
+        with self.database.connection() as conn:
+            client = VocaDbClient(cache_connection=conn)
+            c = client.get_song(song_id)
+            if c is None:
+                return None
+            return {
+                "id": c.id,
+                "name": c.name,
+                "artist_string": c.artist_string,
+                "song_type": c.song_type,
+                "publish_date": c.publish_date,
+                "names": list(c.names),
+                "artists": list(c.artists),
+                "links": list(c.links),
+            }
+
+    @_serialized_write
+    def apply_vocadb_enrichment(
+        self,
+        project_id: str,
+        candidate_data: dict[str, Any],
+        *,
+        apply_name: bool = True,
+        apply_aliases: bool = True,
+        apply_credits: bool = True,
+        apply_links: bool = True,
+    ) -> dict[str, Any]:
+        vocadb_id = int(candidate_data["id"])
+        with self.database.connection() as connection, transaction(connection):
+            row = connection.execute(
+                "SELECT song_id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if row is None:
+                raise LibraryError(f"Project {project_id} does not exist.")
+            song_id = row[0]
+            if song_id is None:
+                song_id = new_id()
+                connection.execute(
+                    "INSERT INTO songs(id, vocadb_id) VALUES (?, ?)",
+                    (song_id, vocadb_id),
+                )
+                connection.execute(
+                    "UPDATE projects SET song_id = ? WHERE id = ?",
+                    (song_id, project_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE songs SET vocadb_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+                    (vocadb_id, song_id),
+                )
+
+            # Check if name is manually overridden
+            overridden_name = connection.execute(
+                "SELECT value_text FROM song_overrides WHERE song_id = ? AND field_name = 'display_name'",
+                (song_id,),
+            ).fetchone()
+
+            if apply_name and not overridden_name:
+                cand_name = str(candidate_data.get("name", "")).strip()
+                if cand_name:
+                    disp = connection.execute(
+                        "SELECT id FROM song_names WHERE song_id = ? AND is_display = 1",
+                        (song_id,),
+                    ).fetchone()
+                    if disp is not None:
+                        connection.execute(
+                            "UPDATE song_names SET text = ?, normalized_text = ?, source_type = 'vocadb', source_identifier = ? WHERE id = ?",
+                            (cand_name, normalize_search_text(cand_name), str(vocadb_id), disp[0]),
+                        )
+                    else:
+                        connection.execute(
+                            """
+                            INSERT INTO song_names(id, song_id, text, normalized_text, is_display, kind, source_type, source_identifier)
+                            VALUES (?, ?, ?, ?, 1, 'primary', 'vocadb', ?)
+                            """,
+                            (new_id(), song_id, cand_name, normalize_search_text(cand_name), str(vocadb_id)),
+                        )
+
+            if apply_aliases:
+                existing_aliases = {
+                    r[0]
+                    for r in connection.execute(
+                        "SELECT normalized_text FROM song_names WHERE song_id = ?",
+                        (song_id,),
+                    ).fetchall()
+                }
+                for n in candidate_data.get("names", []):
+                    alias_val = str(n.get("value", "")).strip()
+                    norm_val = normalize_search_text(alias_val)
+                    if alias_val and norm_val not in existing_aliases:
+                        connection.execute(
+                            """
+                            INSERT INTO song_names(id, song_id, text, normalized_text, language, kind, source_type, source_identifier, is_display)
+                            VALUES (?, ?, ?, ?, ?, 'alias', 'vocadb', ?, 0)
+                            """,
+                            (new_id(), song_id, alias_val, norm_val, n.get("language"), str(vocadb_id)),
+                        )
+                        existing_aliases.add(norm_val)
+
+            if apply_credits:
+                existing_credits = {
+                    (r[0], r[1])
+                    for r in connection.execute(
+                        """
+                        SELECT c.normalized_name, sc.role
+                          FROM song_credits sc
+                          JOIN contributors c ON c.id = sc.contributor_id
+                         WHERE sc.song_id = ?
+                        """,
+                        (song_id,),
+                    ).fetchall()
+                }
+                for art in candidate_data.get("artists", []):
+                    art_name = str(art.get("name", "")).strip()
+                    if not art_name:
+                        continue
+                    norm_art = normalize_search_text(art_name)
+                    role = str(art.get("roles") or art.get("categories") or "Music").strip()
+                    if (norm_art, role) in existing_credits:
+                        continue
+
+                    # Look up or create contributor
+                    c_row = connection.execute(
+                        "SELECT id FROM contributors WHERE normalized_name = ?",
+                        (norm_art,),
+                    ).fetchone()
+                    if c_row is not None:
+                        c_id = c_row[0]
+                    else:
+                        c_id = new_id()
+                        connection.execute(
+                            "INSERT INTO contributors(id, display_name, normalized_name) VALUES (?, ?, ?)",
+                            (c_id, art_name, norm_art),
+                        )
+
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO song_credits(id, song_id, contributor_id, role, source_type, source_identifier)
+                        VALUES (?, ?, ?, ?, 'vocadb', ?)
+                        """,
+                        (new_id(), song_id, c_id, role, str(vocadb_id)),
+                    )
+                    existing_credits.add((norm_art, role))
+
+            if apply_links:
+                existing_urls = {
+                    r[0]
+                    for r in connection.execute(
+                        "SELECT url FROM song_links WHERE song_id = ?", (song_id,)
+                    ).fetchall()
+                }
+                for link in candidate_data.get("links", []):
+                    url = str(link.get("url", "")).strip()
+                    if url and url not in existing_urls:
+                        connection.execute(
+                            """
+                            INSERT INTO song_links(id, song_id, kind, url, label)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (new_id(), song_id, link.get("kind", "web"), url, link.get("label", "Link")),
+                        )
+                        existing_urls.add(url)
+
+        self.rebuild_search_index()
+        return {"project_id": project_id, "song_id": song_id, "vocadb_id": vocadb_id}
+
+    @_serialized_write
+    def unlink_vocadb(self, project_id: str) -> None:
+        with self.database.connection() as connection, transaction(connection):
+            row = connection.execute(
+                "SELECT song_id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                connection.execute(
+                    "UPDATE songs SET vocadb_id = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+                    (row[0],),
+                )
+
+    @_serialized_write
+    def refresh_vocadb(self, project_id: str) -> dict[str, Any]:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT s.vocadb_id
+                  FROM projects p
+                  JOIN songs s ON s.id = p.song_id
+                 WHERE p.id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+            if row is None or row[0] is None:
+                raise LibraryError("Project is not linked to a VocaDB entry.")
+            vocadb_id = row[0]
+
+        candidate = self.fetch_vocadb_candidate(vocadb_id)
+        if candidate is None:
+            raise LibraryError(f"VocaDB entry #{vocadb_id} could not be retrieved.")
+        return self.apply_vocadb_enrichment(project_id, candidate)
+
     def export_metadata(self, destination: str | Path) -> Path:
         """Write a portable JSON metadata snapshot without any project bytes."""
 
