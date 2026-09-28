@@ -7,8 +7,8 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
+from PySide6.QtCore import QMimeData, QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QCloseEvent, QDrag, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -129,6 +129,95 @@ class _Worker(QRunnable):
             self.signals.result.emit(self.context.job_id, self.on_result, result)
         finally:
             self.signals.finished.emit(self.context.job_id)
+
+
+def create_file_drag(source: QWidget, file_path: str | Path) -> QDrag:
+    """Construct an outbound QDrag using copy semantics for an external editor."""
+    path_str = str(Path(file_path).resolve())
+    mime_data = QMimeData()
+    mime_data.setUrls([QUrl.fromLocalFile(path_str)])
+    mime_data.setText(path_str)
+    drag = QDrag(source)
+    drag.setMimeData(mime_data)
+    return drag
+
+
+class DraggableFileLabel(QLabel):
+    """Draggable label allowing users to drop project files into external editors."""
+
+    def __init__(
+        self, get_file_path: Callable[[], str | None], parent: QWidget | None = None
+    ) -> None:
+        super().__init__("Drag files into supported applications", parent)
+        self.get_file_path = get_file_path
+        self._drag_start_pos: QPoint | None = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("Drag files into supported applications")
+        self.setStyleSheet(
+            "padding: 6px; border: 1px dashed #888; border-radius: 4px; text-align: center;"
+        )
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._drag_start_pos is not None
+        ):
+            distance = (
+                event.position().toPoint() - self._drag_start_pos
+            ).manhattanLength()
+            if distance >= QApplication.startDragDistance():
+                path = self.get_file_path()
+                if path and Path(path).exists():
+                    self._drag_start_pos = None
+                    drag = create_file_drag(self, path)
+                    drag.exec(Qt.DropAction.CopyAction)
+                    return
+        super().mouseMoveEvent(event)
+
+
+class ProjectTableWidget(QTableWidget):
+    """Project table supporting row selection and outbound drag to external editors."""
+
+    def __init__(
+        self,
+        rows: int,
+        columns: int,
+        get_project_file: Callable[[int], str | None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(rows, columns, parent)
+        self.get_project_file = get_project_file
+        self._drag_start_pos: QPoint | None = None
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._drag_start_pos is not None
+        ):
+            distance = (
+                event.position().toPoint() - self._drag_start_pos
+            ).manhattanLength()
+            if distance >= QApplication.startDragDistance():
+                item = self.itemAt(self._drag_start_pos)
+                if item:
+                    row = item.row()
+                    path = self.get_project_file(row)
+                    if path and Path(path).exists():
+                        self._drag_start_pos = None
+                        drag = create_file_drag(self, path)
+                        drag.exec(Qt.DropAction.CopyAction)
+                        return
+        super().mouseMoveEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -343,7 +432,7 @@ class MainWindow(QMainWindow):
         self.search_edit.setClearButtonEnabled(True)
         layout.addWidget(self.search_edit)
 
-        self.project_table = QTableWidget(0, len(self.TABLE_COLUMNS), panel)
+        self.project_table = ProjectTableWidget(0, len(self.TABLE_COLUMNS), self._project_file_for_row, panel)
         self.project_table.setHorizontalHeaderLabels(self.TABLE_COLUMNS)
         self.project_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -424,6 +513,12 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.refresh_button)
         button_row.addWidget(self.relink_button)
         layout.addLayout(button_row)
+
+        self.drag_label = DraggableFileLabel(
+            lambda: _value(self._selected_file(), "path", "locator"),
+            panel,
+        )
+        layout.addWidget(self.drag_label)
 
         self.metadata_details = QLabel(panel)
         self.metadata_details.setWordWrap(True)
@@ -654,6 +749,26 @@ class MainWindow(QMainWindow):
             self.project_table.selectRow(0)
         else:
             self._clear_inspector()
+
+    def _project_file_for_row(self, row: int) -> str | None:
+        item = self.project_table.item(row, 0)
+        if not item:
+            return None
+        project_id = item.data(Qt.ItemDataRole.UserRole)
+        project = self._projects.get(_text(project_id))
+        if not project:
+            return None
+        files = _files(project)
+        if not files:
+            return None
+        pref_id = _value(project, "preferred_version_id")
+        for f in files:
+            if _value(f, "is_default_file") and (_value(f, "version_id") == pref_id or not pref_id):
+                return _value(f, "path", "locator")
+        for f in files:
+            if _value(f, "version_id") == pref_id:
+                return _value(f, "path", "locator")
+        return _value(files[0], "path", "locator")
 
     def _select_project_id(self, project_id: str) -> bool:
         for row in range(self.project_table.rowCount()):
