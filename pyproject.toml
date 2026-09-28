@@ -1,6 +1,6 @@
 [project]
 name = "vocavault"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.13"
 description = "A local desktop library for virtual singer projects"
 readme = "README.md"
@@ -25,7 +25,7 @@ build-backend = "hatchling.build"
 packages = ["src/vocavault"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "README.md", "docs/V0_1_IMPLEMENTATION.md", "pyproject.toml", "uv.lock"]
+include = ["src", "tests", "README.md", "docs/V0_1_IMPLEMENTATION.md", "docs/V0_2_IMPLEMENTATION.md", "pyproject.toml", "uv.lock"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
