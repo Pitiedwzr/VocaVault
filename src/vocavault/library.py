@@ -721,7 +721,7 @@ class LibraryService:
             rows = connection.execute(
                 """
                 SELECT p.id AS project_id, p.name AS project_name, p.description,
-                       p.song_id, p.preferred_version_id,
+                       p.song_id, p.preferred_version_id, s.vocadb_id AS vocadb_id,
                        ws.id AS status_id, ws.name AS status_name,
                        v.id AS version_id, v.label AS version_label,
                        v.sort_order AS version_sort_order, v.notes AS version_notes,
@@ -734,6 +734,7 @@ class LibraryService:
                        o.lyric_note_count, o.populated_lyric_count, o.warnings_json,
                        o.id AS observation_id
                   FROM projects p
+                  LEFT JOIN songs s ON s.id = p.song_id
                   LEFT JOIN workflow_statuses ws ON ws.id = p.workflow_status_id
                   JOIN versions v ON v.project_id = p.id
                   JOIN files f ON f.version_id = v.id
@@ -930,6 +931,8 @@ class LibraryService:
                     "project_id": project_id,
                     "name": row["project_name"],
                     "description": row["description"] or "",
+                    "song_id": row["song_id"],
+                    "vocadb_id": row["vocadb_id"],
                     "preferred_version_id": row["preferred_version_id"],
                     "status_id": row["status_id"],
                     "status_name": row["status_name"],
