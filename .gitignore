@@ -14,3 +14,6 @@ build/
 *.sqlite3-wal
 *.log
 /example/
+.idea/
+*.iml
+*-crash-report.xml
