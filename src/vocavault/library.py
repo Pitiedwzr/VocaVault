@@ -294,6 +294,10 @@ class LibraryService:
             from .parsers import UstParser
 
             return UstParser().parse(path)
+        if suffix == ".vsqx":
+            from .parsers import VsqxParser
+
+            return VsqxParser().parse(path)
         format_name = path.suffix.casefold().lstrip(".") or None
         return ParseResult(
             parser_id="builtin.opaque",
@@ -590,6 +594,10 @@ class LibraryService:
             from .parsers import UstParser
 
             return UstParser.parser_id, UstParser.parser_version
+        if suffix == ".vsqx":
+            from .parsers import VsqxParser
+
+            return VsqxParser.parser_id, VsqxParser.parser_version
         return "builtin.opaque", "1"
 
     @_serialized_write
