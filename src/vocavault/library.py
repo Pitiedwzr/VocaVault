@@ -285,10 +285,15 @@ class LibraryService:
 
     @staticmethod
     def _parse(path: Path) -> ParseResult:
-        if path.suffix.casefold() == ".svp":
+        suffix = path.suffix.casefold()
+        if suffix == ".svp":
             from .parsers import SvpParser
 
             return SvpParser().parse(path)
+        if suffix == ".ust":
+            from .parsers import UstParser
+
+            return UstParser().parse(path)
         format_name = path.suffix.casefold().lstrip(".") or None
         return ParseResult(
             parser_id="builtin.opaque",
@@ -576,10 +581,15 @@ class LibraryService:
 
     @staticmethod
     def _parser_identity(path: Path) -> tuple[str, str]:
-        if path.suffix.casefold() == ".svp":
+        suffix = path.suffix.casefold()
+        if suffix == ".svp":
             from .parsers import SvpParser
 
             return SvpParser.parser_id, SvpParser.parser_version
+        if suffix == ".ust":
+            from .parsers import UstParser
+
+            return UstParser.parser_id, UstParser.parser_version
         return "builtin.opaque", "1"
 
     @_serialized_write

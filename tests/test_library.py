@@ -11,8 +11,8 @@ from vocavault.library import LibraryError, LibraryService
 
 
 def test_import_is_idempotent_searchable_and_preserves_source(tmp_path: Path) -> None:
-    source = tmp_path / "ＧＨＯＳＴ-rule.ust"
-    source.write_bytes(b"[#VERSION]\r\nUST Version1.2\r\n")
+    source = tmp_path / "ＧＨＯＳＴ-rule.ppsf"
+    source.write_bytes(b"opaque project bytes")
     original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
     library = LibraryService(tmp_path / "library.sqlite3")
 

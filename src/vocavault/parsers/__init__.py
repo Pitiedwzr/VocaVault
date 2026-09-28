@@ -2,5 +2,6 @@
 
 from vocavault.parsers.base import ParserLimits, ProjectParser
 from vocavault.parsers.svp import SvpParser
+from vocavault.parsers.ust import UstParser
 
-__all__ = ["ParserLimits", "ProjectParser", "SvpParser"]
+__all__ = ["ParserLimits", "ProjectParser", "SvpParser", "UstParser"]
