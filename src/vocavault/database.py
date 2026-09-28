@@ -60,11 +60,22 @@ _REQUIRED_TRIGGERS_V1 = frozenset(
         "default_file_reparent_guard",
     }
 )
+_REQUIRED_TABLES_V2 = frozenset(
+    {
+        *_REQUIRED_TABLES_V1,
+        "search_fts",
+        "api_cache",
+    }
+)
 _REQUIRED_SCHEMA_OBJECTS = {
     1: {
         "table": _REQUIRED_TABLES_V1,
         "trigger": _REQUIRED_TRIGGERS_V1,
-    }
+    },
+    2: {
+        "table": _REQUIRED_TABLES_V2,
+        "trigger": _REQUIRED_TRIGGERS_V1,
+    },
 }
 
 
@@ -535,6 +546,35 @@ _MIGRATIONS: tuple[Migration, ...] = (
                 PRIMARY KEY (file_id, field_name),
                 CHECK (intentionally_cleared = 0 OR value_text IS NULL)
             ) WITHOUT ROWID
+            """,
+        ),
+    ),
+    Migration(
+        2,
+        (
+            """
+            CREATE VIRTUAL TABLE search_fts USING fts5(
+                project_id UNINDEXED,
+                entity_id UNINDEXED,
+                field_type UNINDEXED,
+                raw_text UNINDEXED,
+                normalized_text,
+                tokenize='trigram'
+            )
+            """,
+            """
+            CREATE TABLE api_cache (
+                cache_key TEXT PRIMARY KEY NOT NULL,
+                endpoint TEXT NOT NULL,
+                query_or_id TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                cached_at TEXT NOT NULL DEFAULT
+                    (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )
+            """,
+            """
+            CREATE INDEX api_cache_lookup
+                ON api_cache(endpoint, query_or_id)
             """,
         ),
     ),

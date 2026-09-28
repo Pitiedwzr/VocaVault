@@ -6,6 +6,7 @@ description = "A local desktop library for virtual singer projects"
 readme = "README.md"
 dependencies = [
     "PySide6>=6.8,<7",
+    "rapidfuzz>=3.14.6",
 ]
 
 [project.optional-dependencies]

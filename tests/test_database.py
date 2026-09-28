@@ -51,7 +51,7 @@ class DatabaseTestCase(unittest.TestCase):
             applied = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-            self.assertEqual([row[0] for row in applied], [LATEST_SCHEMA_VERSION])
+            self.assertEqual([row[0] for row in applied], list(range(1, LATEST_SCHEMA_VERSION + 1)))
 
     def test_foreign_keys_and_selection_ownership_are_enforced(self) -> None:
         self.database.initialize()
@@ -172,9 +172,9 @@ class DatabaseTestCase(unittest.TestCase):
             ).fetchone()
             self.assertIsNone(table)
 
-        migration_backups = list(self.root.glob("library.pre-migration-v1-*.sqlite3"))
+        migration_backups = list(self.root.glob(f"library.pre-migration-v{database_module.LATEST_SCHEMA_VERSION}-*.sqlite3"))
         self.assertEqual(len(migration_backups), 1)
-        self.assertEqual(Database(migration_backups[0]).schema_version(), 1)
+        self.assertEqual(Database(migration_backups[0]).schema_version(), database_module.LATEST_SCHEMA_VERSION)
 
     def test_successful_migration_creates_usable_pre_upgrade_backup(self) -> None:
         self.database.initialize()
@@ -197,10 +197,10 @@ class DatabaseTestCase(unittest.TestCase):
         ):
             self.database.initialize()
 
-        migration_backups = list(self.root.glob("library.pre-migration-v1-*.sqlite3"))
+        migration_backups = list(self.root.glob(f"library.pre-migration-v{database_module.LATEST_SCHEMA_VERSION}-*.sqlite3"))
         self.assertEqual(len(migration_backups), 1)
         backup = Database(migration_backups[0])
-        self.assertEqual(backup.schema_version(), 1)
+        self.assertEqual(backup.schema_version(), database_module.LATEST_SCHEMA_VERSION)
         with backup.connection(readonly=True) as connection:
             self.assertEqual(
                 connection.execute(
@@ -214,7 +214,7 @@ class DatabaseTestCase(unittest.TestCase):
                 ).fetchone()
             )
         with self.database.connection() as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], migration.version)
             self.assertIsNotNone(
                 connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE name = 'future_feature'"

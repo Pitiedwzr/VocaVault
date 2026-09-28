@@ -17,6 +17,12 @@ from .fileops import FileFingerprint, fingerprint, open_path, reveal_path
 from .models import Detection, ParseResult, ParseStatus
 from .normalization import normalize_search_text
 
+try:
+    from rapidfuzz import fuzz
+    _HAS_RAPIDFUZZ = True
+except ImportError:
+    _HAS_RAPIDFUZZ = False
+
 PROJECT_EXTENSIONS = {
     ".svp",
     ".ust",
@@ -872,20 +878,46 @@ class LibraryService:
                     normalize_search_text(Path(row["locator"]).name),
                 ),
             ]
-            matches = [
-                candidate
-                for candidate in match_candidates
-                if normalized_query and normalized_query in candidate[3]
-            ]
+            matches = []
+            for candidate in match_candidates:
+                if not normalized_query or not candidate[3]:
+                    continue
+                cand_norm = candidate[3]
+                if cand_norm == normalized_query:
+                    matches.append((candidate[0], candidate[1], candidate[2], cand_norm, "exact", 100))
+                elif cand_norm.startswith(normalized_query):
+                    matches.append((candidate[0], candidate[1], candidate[2], cand_norm, "prefix", 95))
+                elif normalized_query in cand_norm:
+                    matches.append((candidate[0], candidate[1], candidate[2], cand_norm, "substring", 90))
+                elif _HAS_RAPIDFUZZ and len(normalized_query) >= 3:
+                    score = fuzz.WRatio(normalized_query, cand_norm)
+                    if score >= 68.0:
+                        matches.append((candidate[0], candidate[1], candidate[2], cand_norm, "fuzzy", score))
+
             if normalized_query and not matches:
                 continue
 
             def match_rank(item):
-                # Exact names precede substrings; filenames remain lower priority.
-                return (
-                    0 if item[3] == normalized_query and item[0] < 2 else 1,
-                    item[0],
-                )
+                kind_idx = {"exact": 0, "prefix": 1, "substring": 2, "fuzzy": 3}[item[4]]
+                field_priority = item[0]
+                is_title_or_alias = field_priority < 2
+                is_filename = field_priority == 6
+                if kind_idx < 3:
+                    if is_title_or_alias:
+                        tier = 0
+                    elif is_filename:
+                        tier = 4
+                    else:
+                        tier = 1
+                else:
+                    if is_title_or_alias:
+                        tier = 2
+                    elif is_filename:
+                        tier = 5
+                    else:
+                        tier = 3
+                penalty = 100 - int(item[5])
+                return (tier, kind_idx, field_priority, penalty)
 
             best_match = min(matches, default=None, key=match_rank)
             project = projects.setdefault(
@@ -1518,6 +1550,71 @@ class LibraryService:
                 raise LibraryError(
                     "Choose a destination outside the live database and registered files."
                 )
+
+    @_serialized_write
+    def rebuild_search_index(self) -> None:
+        with self.database.connection() as connection, transaction(connection):
+            connection.execute("DELETE FROM search_fts")
+            connection.execute(
+                """
+                INSERT INTO search_fts(project_id, entity_id, field_type, raw_text, normalized_text)
+                SELECT id, id, 'project name', name, normalized_name FROM projects
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO search_fts(project_id, entity_id, field_type, raw_text, normalized_text)
+                SELECT p.id, sn.id, 'song alias', sn.text, sn.normalized_text
+                  FROM projects p
+                  JOIN song_names sn ON sn.song_id = p.song_id
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO search_fts(project_id, entity_id, field_type, raw_text, normalized_text)
+                SELECT p.id, c.id, 'credit', c.display_name, c.normalized_name
+                  FROM projects p
+                  JOIN project_credits pc ON pc.project_id = p.id
+                  JOIN contributors c ON c.id = pc.contributor_id
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO search_fts(project_id, entity_id, field_type, raw_text, normalized_text)
+                SELECT p.id, cn.id, 'contributor alias', cn.text, cn.normalized_text
+                  FROM projects p
+                  JOIN project_credits pc ON pc.project_id = p.id
+                  JOIN contributor_names cn ON cn.contributor_id = pc.contributor_id
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO search_fts(project_id, entity_id, field_type, raw_text, normalized_text)
+                SELECT pt.project_id, t.id, 'tag', t.name, t.normalized_name
+                  FROM project_tags pt
+                  JOIN tags t ON t.id = pt.tag_id
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO search_fts(project_id, entity_id, field_type, raw_text, normalized_text)
+                SELECT p.id, ws.id, 'workflow status', ws.name, ws.normalized_name
+                  FROM projects p
+                  JOIN workflow_statuses ws ON ws.id = p.workflow_status_id
+                 WHERE ws.name IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO search_fts(project_id, entity_id, field_type, raw_text, normalized_text)
+                SELECT DISTINCT v.project_id, ft.id, 'voice', ft.voice_name, ft.normalized_voice_name
+                  FROM file_tracks ft
+                  JOIN parse_observations po ON po.id = ft.observation_id
+                  JOIN files f ON f.id = po.file_id
+                  JOIN versions v ON v.id = f.version_id
+                 WHERE ft.voice_name IS NOT NULL AND ft.voice_name != ''
+                """
+            )
 
     def export_metadata(self, destination: str | Path) -> Path:
         """Write a portable JSON metadata snapshot without any project bytes."""
