@@ -68,6 +68,26 @@ _REQUIRED_TABLES_V2 = frozenset(
     }
 )
 _REQUIRED_TABLES_V3 = _REQUIRED_TABLES_V2
+_SEARCH_SOURCE_TABLES = (
+    "projects",
+    "versions",
+    "files",
+    "song_names",
+    "song_credits",
+    "project_credits",
+    "contributors",
+    "contributor_names",
+    "tags",
+    "project_tags",
+    "workflow_statuses",
+    "parse_observations",
+    "file_tracks",
+)
+_SEARCH_TRIGGERS = {
+    f"search_dirty_{table}_{event.lower()}"
+    for table in _SEARCH_SOURCE_TABLES
+    for event in ("INSERT", "UPDATE", "DELETE")
+}
 _REQUIRED_SCHEMA_OBJECTS = {
     1: {
         "table": _REQUIRED_TABLES_V1,
@@ -80,6 +100,10 @@ _REQUIRED_SCHEMA_OBJECTS = {
     3: {
         "table": _REQUIRED_TABLES_V3,
         "trigger": _REQUIRED_TRIGGERS_V1,
+    },
+    4: {
+        "table": _REQUIRED_TABLES_V3 | {"search_index_state"},
+        "trigger": _REQUIRED_TRIGGERS_V1 | _SEARCH_TRIGGERS,
     },
 }
 
@@ -585,8 +609,23 @@ _MIGRATIONS: tuple[Migration, ...] = (
     ),
     Migration(
         3,
+        ("ALTER TABLE versions ADD COLUMN distribution_terms TEXT",),
+    ),
+)
+
+_MIGRATIONS += (
+    Migration(
+        4,
         (
-            "ALTER TABLE versions ADD COLUMN distribution_terms TEXT",
+            "CREATE TABLE search_index_state (id INTEGER PRIMARY KEY CHECK(id = 1), dirty INTEGER NOT NULL)",
+            "INSERT INTO search_index_state VALUES (1, 1)",
+            *(
+                f"""CREATE TRIGGER search_dirty_{table}_{event.lower()}
+          AFTER {event} ON {table} BEGIN
+          UPDATE search_index_state SET dirty = 1 WHERE id = 1; END"""
+                for table in _SEARCH_SOURCE_TABLES
+                for event in ("INSERT", "UPDATE", "DELETE")
+            ),
         ),
     ),
 )

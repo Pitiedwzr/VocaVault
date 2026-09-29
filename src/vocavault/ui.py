@@ -7,7 +7,19 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 
-from PySide6.QtCore import QMimeData, QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QMimeData,
+    QObject,
+    QPoint,
+    QRunnable,
+    QSettings,
+    Qt,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QAction, QCloseEvent, QDrag, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -21,9 +33,13 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -39,10 +55,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .ui_widgets import MultilineEdit, PathLabel, WrappingLabel
+
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     {".svp", ".ust", ".vsqx", ".ustx", ".vpr", ".ccs", ".ppsf", ".mid"}
 )
-
 
 
 def _value(source: Any, *names: str, default: Any = None) -> Any:
@@ -153,7 +170,7 @@ def create_file_drag(source: QWidget, file_path: str | Path) -> QDrag:
     return drag
 
 
-class DraggableFileLabel(QLabel):
+class DraggableFileLabel(WrappingLabel):
     """Draggable label allowing users to drop project files into external editors."""
 
     def __init__(
@@ -165,7 +182,7 @@ class DraggableFileLabel(QLabel):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.setToolTip("Drag files into supported applications")
         self.setStyleSheet(
-            "padding: 6px; border: 1px dashed #888; border-radius: 4px; text-align: center;"
+            "padding: 6px; border: 1px dashed palette(mid); border-radius: 4px;"
         )
 
     def mousePressEvent(self, event: Any) -> None:
@@ -300,7 +317,7 @@ class GroupProjectsDialog(QDialog):
         self.project_combo = QComboBox(self)
         for p in other_projects:
             p_name = _text(_value(p, "name", "project_name"))
-            file_count = len(_files(p))
+            file_count = _value(p, "file_count", default=len(_files(p)))
             self.project_combo.addItem(f"{p_name} ({file_count} file(s))", p["id"])
         layout.addWidget(self.project_combo)
 
@@ -368,15 +385,23 @@ class VocaDbDialog(QDialog):
         library: Any,
         project: dict[str, Any],
         parent: QWidget | None = None,
+        *,
+        refresh: bool = False,
     ) -> None:
         super().__init__(parent)
         self.library = library
+        self.thread_pool = QThreadPool.globalInstance()
+        self._generation = 0
+        self._closed = False
+        self._applying = False
+        self._workers = {}
+        self._refresh = refresh
         self.project = project
         self.selected_candidate: dict[str, Any] | None = None
         self._candidates: list[dict[str, Any]] = []
 
         self.setWindowTitle("VocaDB Song Enrichment")
-        self.resize(600, 520)
+        self.resize(700, 680)
 
         layout = QVBoxLayout(self)
 
@@ -391,15 +416,25 @@ class VocaDbDialog(QDialog):
         layout.addLayout(search_row)
 
         self.status_label = QLabel(self)
-        self.status_label.setStyleSheet("color: palette(mid); font-style: italic;")
+        self.status_label.setStyleSheet("color: palette(text); font-style: italic;")
         layout.addWidget(self.status_label)
 
         self.candidates_table = QTableWidget(0, 4, self)
-        self.candidates_table.setHorizontalHeaderLabels(["ID", "Title", "Artist", "Type"])
-        self.candidates_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.candidates_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.candidates_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.candidates_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.candidates_table.setHorizontalHeaderLabels(
+            ["ID", "Title", "Artist", "Type"]
+        )
+        self.candidates_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.candidates_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.candidates_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.candidates_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
         self.candidates_table.itemSelectionChanged.connect(self._on_candidate_selected)
         layout.addWidget(self.candidates_table, 1)
 
@@ -408,7 +443,7 @@ class VocaDbDialog(QDialog):
         preview_layout = QVBoxLayout(preview_group)
 
         self.name_check = QCheckBox("Apply Display Name", preview_group)
-        self.name_check.setChecked(True)
+        self.name_check.setChecked(not refresh)
         self.aliases_check = QCheckBox("Apply Song Aliases", preview_group)
         self.aliases_check.setChecked(True)
         self.credits_check = QCheckBox("Apply Original Song Credits", preview_group)
@@ -416,14 +451,16 @@ class VocaDbDialog(QDialog):
         self.links_check = QCheckBox("Apply Media Links", preview_group)
         self.links_check.setChecked(True)
 
-        chk_row = QHBoxLayout()
+        chk_row = QVBoxLayout()
         chk_row.addWidget(self.name_check)
         chk_row.addWidget(self.aliases_check)
         chk_row.addWidget(self.credits_check)
         chk_row.addWidget(self.links_check)
         preview_layout.addLayout(chk_row)
 
-        self.preview_text = QLabel("Select a candidate to preview fields.", preview_group)
+        self.preview_text = WrappingLabel(
+            "Select a candidate to preview fields.", preview_group
+        )
         self.preview_text.setWordWrap(True)
         preview_layout.addWidget(self.preview_text)
 
@@ -431,9 +468,15 @@ class VocaDbDialog(QDialog):
             "Note: Song-level enrichment preserves tuner credits and version distribution terms.",
             preview_group,
         )
-        terms_note.setStyleSheet("color: palette(mid); font-size: 11px;")
+        terms_note.setStyleSheet("color: palette(text); font-size: 11px;")
         preview_layout.addWidget(terms_note)
-        layout.addWidget(preview_group)
+        preview_scroll = QScrollArea(self)
+        preview_scroll.setWidgetResizable(True)
+        preview_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        preview_scroll.setWidget(preview_group)
+        layout.addWidget(preview_scroll, 1)
 
         btn_box = QHBoxLayout()
         self.apply_button = QPushButton("Apply Enrichment", self)
@@ -446,7 +489,15 @@ class VocaDbDialog(QDialog):
         btn_box.addWidget(self.apply_button)
         layout.addLayout(btn_box)
 
-        if initial_query:
+        if refresh:
+            self.status_label.setText("Fetching current VocaDB fields for review…")
+            self._start_task(
+                lambda: [
+                    self.library.preview_vocadb_refresh(_text(self.project["id"]))
+                ],
+                self._search_complete,
+            )
+        elif initial_query:
             self._do_search()
 
     def _do_search(self) -> None:
@@ -459,35 +510,87 @@ class VocaDbDialog(QDialog):
         self.apply_button.setEnabled(False)
         self.preview_text.setText("Searching…")
 
-        try:
-            candidates = self.library.search_vocadb_candidates(query)
-            self._candidates = [
-                cand if isinstance(cand, dict) else {
-                    "id": getattr(cand, "id", 0),
-                    "name": getattr(cand, "name", ""),
-                    "artist_string": getattr(cand, "artist_string", ""),
-                    "song_type": getattr(cand, "song_type", ""),
-                    "names": getattr(cand, "names", ()),
-                    "artists": getattr(cand, "artists", ()),
-                    "links": getattr(cand, "links", ()),
-                }
-                for cand in candidates
-            ]
-            self.candidates_table.setRowCount(len(self._candidates))
-            for row, cand in enumerate(self._candidates):
-                self.candidates_table.setItem(row, 0, QTableWidgetItem(str(cand.get("id"))))
-                self.candidates_table.setItem(row, 1, QTableWidgetItem(str(cand.get("name"))))
-                self.candidates_table.setItem(row, 2, QTableWidgetItem(str(cand.get("artist_string"))))
-                self.candidates_table.setItem(row, 3, QTableWidgetItem(str(cand.get("song_type"))))
-            if self._candidates:
-                self.status_label.setText(f"Found {len(self._candidates)} candidate(s).")
-                self.candidates_table.selectRow(0)
-            else:
-                self.status_label.setText("No candidates found on VocaDB.")
-                self.preview_text.setText("No matches found.")
-        except Exception as exc:
-            self.status_label.setText("Could not reach VocaDB. Local data is unaffected.")
-            self.preview_text.setText(f"Error: {exc}\nOffline/local library remains fully functional.")
+        self._start_task(
+            lambda: self.library.search_vocadb_candidates(query), self._search_complete
+        )
+
+    def _search_complete(self, candidates):
+        self._candidates = [
+            cand
+            if isinstance(cand, dict)
+            else {
+                "id": getattr(cand, "id", 0),
+                "name": getattr(cand, "name", ""),
+                "artist_string": getattr(cand, "artist_string", ""),
+                "song_type": getattr(cand, "song_type", ""),
+                "names": getattr(cand, "names", ()),
+                "artists": getattr(cand, "artists", ()),
+                "links": getattr(cand, "links", ()),
+            }
+            for cand in candidates
+        ]
+        self.candidates_table.setRowCount(len(self._candidates))
+        for row, cand in enumerate(self._candidates):
+            self.candidates_table.setItem(row, 0, QTableWidgetItem(str(cand.get("id"))))
+            self.candidates_table.setItem(
+                row, 1, QTableWidgetItem(str(cand.get("name")))
+            )
+            self.candidates_table.setItem(
+                row, 2, QTableWidgetItem(str(cand.get("artist_string")))
+            )
+            self.candidates_table.setItem(
+                row, 3, QTableWidgetItem(str(cand.get("song_type")))
+            )
+        if self._candidates:
+            self.status_label.setText(f"Found {len(self._candidates)} candidate(s).")
+            self.candidates_table.selectRow(0)
+        else:
+            self.status_label.setText("No candidates found on VocaDB.")
+            self.preview_text.setText("No matches found.")
+
+    def _start_task(self, function, callback):
+        self._generation += 1
+        generation = self._generation
+        context = _JobContext(generation, Event(), lambda *_: None)
+        worker = _Worker(context, lambda _: function(), callback)
+        worker.signals.result.connect(
+            self._task_result, Qt.ConnectionType.QueuedConnection
+        )
+        worker.signals.error.connect(
+            self._task_error, Qt.ConnectionType.QueuedConnection
+        )
+        worker.signals.finished.connect(
+            self._task_finished, Qt.ConnectionType.QueuedConnection
+        )
+        self._workers[generation] = worker
+        self.thread_pool.start(worker)
+
+    @Slot(int, object, object)
+    def _task_result(self, generation, callback, value):
+        if not self._closed and generation == self._generation:
+            callback(value)
+
+    @Slot(int, str)
+    def _task_error(self, generation, message):
+        if not self._closed and generation == self._generation:
+            self._applying = False
+            self.search_button.setEnabled(True)
+            self.cancel_button.setEnabled(True)
+            self.status_label.setText(
+                "Could not reach VocaDB or finish the operation. Local work remains available."
+            )
+            self.preview_text.setText(message)
+
+    @Slot(int)
+    def _task_finished(self, generation):
+        self._workers.pop(generation, None)
+
+    def reject(self):
+        if self._applying:
+            return
+        self._closed = True
+        self._generation += 1
+        super().reject()
 
     def _on_candidate_selected(self) -> None:
         selected_rows = self.candidates_table.selectionModel().selectedRows()
@@ -502,8 +605,9 @@ class VocaDbDialog(QDialog):
         self.apply_button.setEnabled(True)
 
         preview_lines = [
-            f"<b>Title:</b> {_text(cand.get('name'))}",
-            f"<b>Artist(s):</b> {_text(cand.get('artist_string'))}",
+            f"Current project: {_display_name(self.project)}",
+            f"Proposed title: {_text(cand.get('name'))}",
+            f"Artist(s): {_text(cand.get('artist_string'))}",
         ]
         names = cand.get("names", [])
         if names:
@@ -512,7 +616,7 @@ class VocaDbDialog(QDialog):
                 for n in names
                 if isinstance(n, dict)
             ]
-            preview_lines.append(f"<b>Aliases:</b> {', '.join(alias_strs)}")
+            preview_lines.append(f"Aliases: {', '.join(alias_strs)}")
         artists = cand.get("artists", [])
         if artists:
             art_strs = [
@@ -520,7 +624,7 @@ class VocaDbDialog(QDialog):
                 for a in artists
                 if isinstance(a, dict)
             ]
-            preview_lines.append(f"<b>Credits:</b> {', '.join(art_strs)}")
+            preview_lines.append(f"Original song credits: {', '.join(art_strs)}")
         links = cand.get("links", [])
         if links:
             link_strs = [
@@ -528,31 +632,38 @@ class VocaDbDialog(QDialog):
                 for l in links
                 if isinstance(l, dict)
             ]
-            preview_lines.append(f"<b>Links:</b> {', '.join(link_strs[:3])}")
+            preview_lines.append(f"Links: {', '.join(link_strs[:3])}")
 
-        self.preview_text.setText("<br>".join(preview_lines))
+        self.preview_text.setText("\n\n".join(preview_lines))
 
     def _apply_enrichment(self) -> None:
         if not self.selected_candidate:
             return
         project_id = _text(_value(self.project, "id", "project_id"))
-        try:
-            self.library.apply_vocadb_enrichment(
-                project_id,
-                self.selected_candidate,
-                apply_name=self.name_check.isChecked(),
-                apply_aliases=self.aliases_check.isChecked(),
-                apply_credits=self.credits_check.isChecked(),
-                apply_links=self.links_check.isChecked(),
-                overwrite_overrides=True,
-            )
-            self.accept()
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "VocaDB Error",
-                f"Could not apply VocaDB enrichment: {exc}\nLocal data was not modified.",
-            )
+        candidate = dict(self.selected_candidate)
+        options = {
+            "apply_name": self.name_check.isChecked(),
+            "apply_aliases": self.aliases_check.isChecked(),
+            "apply_credits": self.credits_check.isChecked(),
+            "apply_links": self.links_check.isChecked(),
+            "overwrite_overrides": self.name_check.isChecked(),
+        }
+        self._applying = True
+        self.apply_button.setEnabled(False)
+        self.search_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
+        self.status_label.setText("Applying selected fields…")
+        self._start_task(
+            lambda: self.library.apply_vocadb_enrichment(
+                project_id, candidate, **options
+            ),
+            self._applied,
+        )
+
+    def _applied(self, _result):
+        self._applying = False
+        self._closed = True
+        self.accept()
 
 
 class MainWindow(QMainWindow):
@@ -567,6 +678,13 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool(self)
         self._projects: dict[str, Any] = {}
         self._selected_project: Any = None
+        self._loading_inspector = True
+        self._project_snapshot = None
+        self._version_snapshot = None
+        self._editing_version = None
+        self._selection_generation = 0
+        self._restore_version_id = None
+        self.settings = QSettings("VocaVault", "VocaVault")
         self._search_generation = 0
         self._active_jobs = 0
         self._next_job_id = 1
@@ -603,6 +721,8 @@ class MainWindow(QMainWindow):
         self.project_table.itemSelectionChanged.connect(self._show_selected_project)
         self.file_combo.currentIndexChanged.connect(self._update_file_details)
 
+        self._loading_inspector = False
+        self._restore_layout()
         self.reload_projects()
 
     def _create_actions(self) -> None:
@@ -690,14 +810,16 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
 
     def _create_panels(self) -> None:
-        splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        splitter.addWidget(self._navigation_panel())
+        splitter = self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.navigation_panel = self._navigation_panel()
+        splitter.addWidget(self.navigation_panel)
         splitter.addWidget(self._library_panel())
-        splitter.addWidget(self._inspector_panel())
+        self.inspector_panel = self._inspector_panel()
+        splitter.addWidget(self.inspector_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([210, 680, 390])
+        splitter.setSizes([190, 750, 340])
         self.setCentralWidget(splitter)
 
     def _navigation_panel(self) -> QWidget:
@@ -710,12 +832,14 @@ class MainWindow(QMainWindow):
         layout.setSpacing(4)
 
         heading = QLabel("Library", panel)
-        heading.setProperty("heading", True)
+        heading.setStyleSheet("font-size: 14px; font-weight: 600;")
         layout.addWidget(heading)
 
         def add_filter_label(text: str) -> None:
             lbl = QLabel(text, panel)
-            lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: palette(mid); margin-top: 5px;")
+            lbl.setStyleSheet(
+                "font-size: 11px; font-weight: 600; color: palette(text); margin-top: 5px;"
+            )
             layout.addWidget(lbl)
 
         add_filter_label("Engine")
@@ -779,7 +903,7 @@ class MainWindow(QMainWindow):
             panel,
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        hint.setStyleSheet("color: palette(text); font-size: 11px;")
         layout.addWidget(hint)
         return panel
 
@@ -810,13 +934,19 @@ class MainWindow(QMainWindow):
         )
         self.project_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.project_table.setAlternatingRowColors(True)
-        self.project_table.setSortingEnabled(True)
+        self.project_table.setSortingEnabled(False)
         self.project_table.verticalHeader().setVisible(False)
         header = self.project_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for column in range(1, len(self.TABLE_COLUMNS)):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        self.project_table.doubleClicked.connect(self.open_selected_file)
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            header.resizeSection(column, 78)
+        self.project_table.doubleClicked.connect(self.open_table_project)
+        header.sectionClicked.connect(
+            lambda column: self.project_table.sortItems(
+                column, header.sortIndicatorOrder()
+            )
+        )
         self.table_stack.addWidget(self.project_table)
 
         self.empty_state_frame = QFrame(self.table_stack)
@@ -832,7 +962,7 @@ class MainWindow(QMainWindow):
         empty_layout.addWidget(self.empty_state_title)
 
         self.empty_state_desc = QLabel("", self.empty_state_frame)
-        self.empty_state_desc.setStyleSheet("color: palette(mid); font-size: 12px;")
+        self.empty_state_desc.setStyleSheet("color: palette(text); font-size: 12px;")
         self.empty_state_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_state_desc.setWordWrap(True)
         empty_layout.addWidget(self.empty_state_desc)
@@ -846,6 +976,8 @@ class MainWindow(QMainWindow):
 
         self.table_stack.addWidget(self.empty_state_frame)
         layout.addWidget(self.table_stack, 1)
+        self.match_evidence = WrappingLabel("", panel)
+        layout.addWidget(self.match_evidence)
         return panel
 
     def _inspector_panel(self) -> QWidget:
@@ -859,83 +991,117 @@ class MainWindow(QMainWindow):
 
         header_layout = QHBoxLayout()
         heading = QLabel("Inspector", panel)
-        heading.setProperty("heading", True)
+        heading.setStyleSheet("font-size: 14px; font-weight: 600;")
         header_layout.addWidget(heading)
         layout.addLayout(header_layout)
 
         self.inspector_tabs = QTabWidget(panel)
         self.inspector_tabs.addTab(self._metadata_tab(self.inspector_tabs), "Metadata")
         self.inspector_tabs.addTab(
-            self._versions_files_tab(self.inspector_tabs), "Versions & Files"
+            self._versions_files_tab(self.inspector_tabs), "Versions && Files"
         )
         layout.addWidget(self.inspector_tabs)
+        self.dirty_label = QLabel("", panel)
+        self.dirty_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(self.dirty_label)
+        actions = QHBoxLayout()
+        self.open_file_button = QPushButton("Open file", panel)
+        self.open_file_button.setStyleSheet("font-weight: 600; padding: 6px;")
+        self.open_file_button.clicked.connect(self.open_selected_file)
+        self.reveal_file_button = QPushButton("Reveal", panel)
+        self.reveal_file_button.clicked.connect(self.reveal_selected_file)
+        actions.addWidget(self.open_file_button)
+        actions.addWidget(self.reveal_file_button)
+        layout.addLayout(actions)
+        for widget in (
+            self.name_edit,
+            self.description_edit,
+            self.status_edit,
+            self.aliases_edit,
+            self.credits_edit,
+            self.tags_edit,
+            self.version_terms_edit,
+            self.version_notes_edit,
+        ):
+            widget.textChanged.connect(self._update_dirty_state)
         return panel
 
     def _metadata_tab(self, parent: QWidget) -> QWidget:
         scroll = QScrollArea(parent)
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-
         content = QWidget(scroll)
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(8)
-
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+        self.project_summary = WrappingLabel(
+            "Select a project to view its metadata.", content
+        )
+        layout.addWidget(self.project_summary)
+        self.edit_metadata_button = QPushButton("Edit metadata", content)
+        self.edit_metadata_button.setCheckable(True)
+        layout.addWidget(self.edit_metadata_button)
+        self.metadata_editor = QWidget(content)
+        editor_layout = QVBoxLayout(self.metadata_editor)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
         form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self.name_edit = QLineEdit(content)
-        self.description_edit = QPlainTextEdit(content)
-        self.description_edit.setMaximumHeight(80)
+        self.description_edit = MultilineEdit(content)
         self.status_edit = QLineEdit(content)
-        self.status_edit.setPlaceholderText("Workflow status")
-        self.aliases_edit = QPlainTextEdit(content)
-        self.aliases_edit.setMaximumHeight(60)
+        self.aliases_edit = MultilineEdit(content)
         self.aliases_edit.setPlaceholderText("One song alias per line")
-        self.credits_edit = QPlainTextEdit(content)
-        self.credits_edit.setMaximumHeight(70)
-        self.credits_edit.setPlaceholderText("One credit per line: role: contributor")
+        self.credits_edit = MultilineEdit(content)
+        self.credits_edit.setPlaceholderText(
+            "One project credit per line: role: contributor"
+        )
         self.tags_edit = QLineEdit(content)
         self.tags_edit.setPlaceholderText("Comma-separated tags")
-
-        form.addRow("Project", self.name_edit)
-        form.addRow("Description", self.description_edit)
-        form.addRow("Status", self.status_edit)
-        form.addRow("Aliases", self.aliases_edit)
-        form.addRow("Credits", self.credits_edit)
-        form.addRow("Tags", self.tags_edit)
-        layout.addLayout(form)
-
-        proj_btn_row = QHBoxLayout()
-        self.save_button = QPushButton("Save Project", content)
+        for title, widget in (
+            ("Project name", self.name_edit),
+            ("Description", self.description_edit),
+            ("Workflow status", self.status_edit),
+            ("Song aliases", self.aliases_edit),
+            ("Project credits", self.credits_edit),
+            ("Tags", self.tags_edit),
+        ):
+            form.addRow(title, widget)
+        editor_layout.addLayout(form)
+        self.save_button = QPushButton("Save project", content)
         self.save_button.clicked.connect(self.save_project)
-        self.group_project_button = QPushButton("Group into…", content)
+        editor_layout.addWidget(self.save_button)
+        layout.addWidget(self.metadata_editor)
+        self.metadata_editor.hide()
+        self.edit_metadata_button.toggled.connect(self.metadata_editor.setVisible)
+        self.original_credits = WrappingLabel("", content)
+        layout.addWidget(self.original_credits)
+        self.group_project_button = QPushButton("Group project…", content)
         self.group_project_button.clicked.connect(self.group_selected_project)
-        proj_btn_row.addWidget(self.save_button)
-        proj_btn_row.addWidget(self.group_project_button)
-        layout.addLayout(proj_btn_row)
-
-        vocadb_group = QGroupBox("VocaDB Enrichment", content)
-        vocadb_layout = QVBoxLayout(vocadb_group)
-        vocadb_layout.setSpacing(6)
-
-        self.vocadb_button = QPushButton("Enrich from VocaDB…", vocadb_group)
+        layout.addWidget(self.group_project_button)
+        vocadb_group = QGroupBox("VocaDB", content)
+        vlayout = QVBoxLayout(vocadb_group)
+        self.vocadb_button = QPushButton("Find a song match…", content)
         self.vocadb_button.clicked.connect(self.enrich_selected_with_vocadb)
-        vocadb_layout.addWidget(self.vocadb_button)
-
-        vocadb_sub_row = QHBoxLayout()
-        self.vocadb_refresh_button = QPushButton("Refresh", vocadb_group)
+        vlayout.addWidget(self.vocadb_button)
+        self.vocadb_refresh_button = QPushButton("Review updates", content)
         self.vocadb_refresh_button.clicked.connect(self.refresh_selected_vocadb)
-        self.vocadb_unlink_button = QPushButton("Unlink", vocadb_group)
+        self.vocadb_unlink_button = QPushButton("Unlink", content)
         self.vocadb_unlink_button.clicked.connect(self.unlink_selected_vocadb)
-        vocadb_sub_row.addWidget(self.vocadb_refresh_button)
-        vocadb_sub_row.addWidget(self.vocadb_unlink_button)
-        vocadb_layout.addLayout(vocadb_sub_row)
-
-        self.vocadb_status = QLabel(vocadb_group)
-        self.vocadb_status.setStyleSheet("color: palette(mid); font-size: 11px;")
-        vocadb_layout.addWidget(self.vocadb_status)
+        vlayout.addWidget(self.vocadb_refresh_button)
+        vlayout.addWidget(self.vocadb_unlink_button)
+        self.vocadb_status = WrappingLabel("", content)
+        vlayout.addWidget(self.vocadb_status)
         layout.addWidget(vocadb_group)
-
+        self.metadata_details = WrappingLabel("", content)
+        self.metadata_details.hide()
+        song_details = QPushButton("Song details…", content)
+        song_details.clicked.connect(
+            lambda: self._show_text_dialog(
+                "Song metadata", self.metadata_details.text()
+            )
+        )
+        layout.addWidget(song_details)
         layout.addStretch(1)
         scroll.setWidget(content)
         return scroll
@@ -943,113 +1109,113 @@ class MainWindow(QMainWindow):
     def _versions_files_tab(self, parent: QWidget) -> QWidget:
         scroll = QScrollArea(parent)
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-
         content = QWidget(scroll)
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(8)
-
-        # Versions section
-        ver_group = QGroupBox("Version Management", content)
-        ver_layout = QVBoxLayout(ver_group)
-        ver_layout.setSpacing(6)
-
-        ver_row = QHBoxLayout()
-        self.version_combo = QComboBox(ver_group)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel("Version", content))
+        row = QHBoxLayout()
+        self.version_combo = QComboBox(content)
+        self.version_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.version_combo.setMinimumContentsLength(8)
         self.version_combo.currentIndexChanged.connect(self._on_version_selected)
-        self.new_version_button = QPushButton("+ Version…", ver_group)
+        row.addWidget(self.version_combo, 1)
+        self.new_version_button = QPushButton("+", content)
+        self.new_version_button.setFixedWidth(30)
+        self.new_version_button.setToolTip("Create version")
+        self.new_version_button.setAccessibleName("Create version")
         self.new_version_button.clicked.connect(self.create_new_version)
-        ver_row.addWidget(self.version_combo, 1)
-        ver_row.addWidget(self.new_version_button)
-        ver_layout.addLayout(ver_row)
-
-        ver_form = QFormLayout()
-        ver_form.setFieldGrowthPolicy(
-            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
-        )
-        self.version_terms_edit = QLineEdit(ver_group)
-        self.version_terms_edit.setPlaceholderText("Distribution terms (e.g. CC-BY)")
-        self.version_notes_edit = QLineEdit(ver_group)
-        self.version_notes_edit.setPlaceholderText("Version notes")
-        ver_form.addRow("Terms", self.version_terms_edit)
-        ver_form.addRow("Notes", self.version_notes_edit)
-        ver_layout.addLayout(ver_form)
-
-        ver_act_row = QHBoxLayout()
-        self.set_preferred_button = QPushButton("Set as Preferred", ver_group)
+        row.addWidget(self.new_version_button)
+        menu_button = QPushButton("More", content)
+        menu_button.setFixedWidth(60)
+        menu = QMenu(menu_button)
+        menu.addAction("Rename version…", self.rename_selected_version)
+        menu.addAction("Set as preferred", self.set_selected_preferred_version)
+        menu_button.setMenu(menu)
+        row.addWidget(menu_button)
+        layout.addLayout(row)
+        self.version_badge = QLabel("", content)
+        self.version_badge.setStyleSheet("font-weight: 600;")
+        layout.addWidget(self.version_badge)
+        self.set_preferred_button = QPushButton("Set as preferred", content)
         self.set_preferred_button.clicked.connect(self.set_selected_preferred_version)
-        self.save_version_button = QPushButton("Save Version", ver_group)
+        self.set_preferred_button.hide()
+        self.version_terms_edit = MultilineEdit(content)
+        self.version_notes_edit = MultilineEdit(content)
+        self.version_terms_edit.setPlaceholderText("Distribution terms")
+        self.version_notes_edit.setPlaceholderText("Version notes")
+        version_details = QWidget(content)
+        form = QFormLayout(version_details)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        form.addRow("Distribution terms", self.version_terms_edit)
+        form.addRow("Notes", self.version_notes_edit)
+        self.save_version_button = QPushButton("Save version", content)
         self.save_version_button.clicked.connect(self.save_selected_version)
-        ver_act_row.addWidget(self.set_preferred_button)
-        ver_act_row.addWidget(self.save_version_button)
-        ver_layout.addLayout(ver_act_row)
-        layout.addWidget(ver_group)
-
-        # Files section
-        file_group = QGroupBox("Files", content)
-        file_layout = QVBoxLayout(file_group)
-        file_layout.setSpacing(6)
-
-        self.file_combo = QComboBox(file_group)
-        file_layout.addWidget(self.file_combo)
-
-        file_act_row = QHBoxLayout()
-        self.set_default_file_button = QPushButton("Set as Default", file_group)
-        self.set_default_file_button.clicked.connect(self.set_selected_default_file)
-        self.move_to_version_button = QPushButton("Move to Version…", file_group)
-        self.move_to_version_button.clicked.connect(self.move_selected_file_to_version)
-        file_act_row.addWidget(self.set_default_file_button)
-        file_act_row.addWidget(self.move_to_version_button)
-        file_layout.addLayout(file_act_row)
-
-        self.file_details = QLabel(
-            "Select a project to inspect its files.", file_group
+        form.addRow(self.save_version_button)
+        full_editor = QPushButton("Expand editor…", content)
+        full_editor.clicked.connect(self.expand_version_editor)
+        form.addRow(full_editor)
+        expand = QPushButton("Notes and terms", content)
+        expand.setCheckable(True)
+        expand.toggled.connect(version_details.setVisible)
+        layout.addWidget(expand)
+        layout.addWidget(version_details)
+        version_details.hide()
+        layout.addWidget(QLabel("Files in this version", content))
+        self.file_list = QListWidget(content)
+        self.file_list.setMinimumWidth(0)
+        self.file_list.setFixedHeight(100)
+        self.file_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.file_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.file_details.setWordWrap(True)
-        self.file_details.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
+        self.file_list.currentRowChanged.connect(
+            lambda row: self.file_combo.setCurrentIndex(row)
         )
-        self.file_details.setStyleSheet(
-            "padding: 4px; background: palette(alternate-base); border-radius: 4px; font-size: 11px;"
-        )
-        file_layout.addWidget(self.file_details)
-
-        btn_row_1 = QHBoxLayout()
-        open_button = QPushButton("Open", file_group)
-        open_button.clicked.connect(self.open_selected_file)
-        reveal_button = QPushButton("Reveal", file_group)
-        reveal_button.clicked.connect(self.reveal_selected_file)
-        btn_row_1.addWidget(open_button)
-        btn_row_1.addWidget(reveal_button)
-        file_layout.addLayout(btn_row_1)
-
-        btn_row_2 = QHBoxLayout()
-        self.refresh_button = QPushButton("Refresh", file_group)
+        self.file_list.itemDoubleClicked.connect(self.open_selected_file)
+        layout.addWidget(self.file_list)
+        # Shared selection model for existing file actions and URL drag support.
+        self.file_combo = QComboBox(content)
+        self.file_combo.hide()
+        self.file_combo.currentIndexChanged.connect(self.file_list.setCurrentRow)
+        self.path_label = PathLabel(content)
+        layout.addWidget(self.path_label)
+        self.file_details = WrappingLabel("", content)
+        layout.addWidget(self.file_details)
+        self.file_problems = WrappingLabel("", content)
+        layout.addWidget(self.file_problems)
+        self.file_more_button = QPushButton("File actions", content)
+        menu = QMenu(self.file_more_button)
+        menu.addAction("Copy full path", self.copy_selected_path)
+        menu.addAction("Open with…", self.open_selected_file_with)
+        menu.addAction("Set as default", self.set_selected_default_file)
+        menu.addAction("Move to version…", self.move_selected_file_to_version)
+        self.file_more_button.setMenu(menu)
+        layout.addWidget(self.file_more_button)
+        self.set_default_file_button = QPushButton(content)
+        self.set_default_file_button.hide()
+        self.move_to_version_button = QPushButton(content)
+        self.move_to_version_button.hide()
+        row = QHBoxLayout()
+        self.refresh_button = QPushButton("Refresh", content)
         self.refresh_button.clicked.connect(self.refresh_selected_file)
-        self.relink_button = QPushButton("Relink…", file_group)
+        self.relink_button = QPushButton("Relink…", content)
         self.relink_button.clicked.connect(self.relink_selected_file)
-        btn_row_2.addWidget(self.refresh_button)
-        btn_row_2.addWidget(self.relink_button)
-        file_layout.addLayout(btn_row_2)
-
+        row.addWidget(self.refresh_button)
+        row.addWidget(self.relink_button)
+        layout.addLayout(row)
+        details = QPushButton("Technical details…", content)
+        details.clicked.connect(self.show_file_details)
+        layout.addWidget(details)
         self.drag_label = DraggableFileLabel(
-            lambda: _value(self._selected_file(), "path", "locator"),
-            file_group,
+            lambda: _value(self._selected_file(), "path", "locator"), content
         )
-        file_layout.addWidget(self.drag_label)
-        layout.addWidget(file_group)
-
-        self.metadata_details = QLabel(content)
-        self.metadata_details.setWordWrap(True)
-        self.metadata_details.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        self.metadata_details.setStyleSheet(
-            "color: palette(mid); font-size: 11px; padding: 4px;"
-        )
-        layout.addWidget(self.metadata_details)
-
+        layout.addWidget(self.drag_label)
         layout.addStretch(1)
         scroll.setWidget(content)
         return scroll
@@ -1071,6 +1237,212 @@ class MainWindow(QMainWindow):
 
     def _filter_value(self, combo: QComboBox) -> Any:
         return combo.currentData()
+
+    def _project_values(self):
+        return (
+            self.name_edit.text(),
+            self.description_edit.toPlainText(),
+            self.status_edit.text(),
+            self.aliases_edit.toPlainText(),
+            self.credits_edit.toPlainText(),
+            self.tags_edit.text(),
+        )
+
+    def _version_values(self):
+        return (self.version_terms_edit.text(), self.version_notes_edit.text())
+
+    def _update_dirty_state(self):
+        if self._loading_inspector:
+            return
+        project_dirty = (
+            self._project_snapshot is not None
+            and self._project_values() != self._project_snapshot
+        )
+        version_dirty = (
+            self._version_snapshot is not None
+            and self._version_values() != self._version_snapshot
+        )
+        self.dirty_label.setText(
+            "Unsaved changes" if project_dirty or version_dirty else ""
+        )
+        self.save_button.setEnabled(bool(project_dirty) and not self._mutation_jobs)
+        self.save_version_button.setEnabled(
+            bool(version_dirty) and not self._mutation_jobs
+        )
+        self.edit_metadata_button.setEnabled(self._selected_project is not None)
+
+    def _confirm_pending_edits(self):
+        if self._loading_inspector:
+            return True
+        project_dirty = (
+            self._project_snapshot is not None
+            and self._project_values() != self._project_snapshot
+        )
+        version_dirty = (
+            self._version_snapshot is not None
+            and self._version_values() != self._version_snapshot
+        )
+        if not (project_dirty or version_dirty):
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Unsaved changes",
+            "Save your changes before continuing?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+        if answer == QMessageBox.StandardButton.Save:
+            if project_dirty and not self.save_project(reload=False):
+                return False
+            if version_dirty and not self.save_selected_version():
+                return False
+        else:
+            self._loading_inspector = True
+            if project_dirty:
+                name, desc, status, aliases, credits, tags = self._project_snapshot
+                self.name_edit.setText(name)
+                self.description_edit.setPlainText(desc)
+                self.status_edit.setText(status)
+                self.aliases_edit.setPlainText(aliases)
+                self.credits_edit.setPlainText(credits)
+                self.tags_edit.setText(tags)
+            if version_dirty:
+                terms, notes = self._version_snapshot
+                self.version_terms_edit.setText(terms)
+                self.version_notes_edit.setText(notes)
+            self._loading_inspector = False
+        self._update_dirty_state()
+        return True
+
+    def _show_text_dialog(self, title, text):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(650, 500)
+        layout = QVBoxLayout(dialog)
+        viewer = QPlainTextEdit(dialog)
+        viewer.setReadOnly(True)
+        viewer.setPlainText(text)
+        viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        layout.addWidget(viewer)
+        close = QPushButton("Close", dialog)
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def show_file_details(self):
+        file = self._selected_file()
+        if not file:
+            return
+        lines = [
+            self.path_label.path,
+            "",
+            f"Format: {_value(file, 'format_name')} {_text(_value(file, 'format_version'))}",
+            f"Parse: {_value(file, 'parse_status')}",
+            f"Availability (last checked): {_value(file, 'health')}",
+        ]
+        lines += [
+            f"{key}: {_text(value, 'Unknown')}"
+            for key, value in _value(file, "details", default={}).items()
+        ]
+        lines += [
+            "",
+            "Warnings",
+            *(_value(file, "warnings", default=[]) or ["None reported"]),
+        ]
+        self._show_text_dialog("File details", "\n".join(lines))
+
+    def copy_selected_path(self):
+        if self._selected_file():
+            QApplication.clipboard().setText(self.path_label.path)
+            self.statusBar().showMessage("Path copied", 2500)
+
+    def expand_version_editor(self):
+        if not self._editing_version:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Version notes and distribution terms")
+        dialog.resize(650, 560)
+        layout = QVBoxLayout(dialog)
+        editors = []
+        for title, source in (
+            ("Distribution terms", self.version_terms_edit),
+            ("Notes", self.version_notes_edit),
+        ):
+            layout.addWidget(QLabel(title, dialog))
+            editor = QPlainTextEdit(dialog)
+            editor.setPlainText(source.text())
+            editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            layout.addWidget(editor)
+            editors.append((editor, source))
+        row = QHBoxLayout()
+        cancel = QPushButton("Cancel", dialog)
+        cancel.clicked.connect(dialog.reject)
+        done = QPushButton("Use changes", dialog)
+        done.clicked.connect(dialog.accept)
+        row.addWidget(cancel)
+        row.addWidget(done)
+        layout.addLayout(row)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            for editor, source in editors:
+                source.setText(editor.toPlainText())
+
+    def rename_selected_version(self):
+        if not self._editing_version or not self._confirm_pending_edits():
+            return
+        label, accepted = QInputDialog.getText(
+            self,
+            "Rename version",
+            "Label",
+            text=_text(_value(self._editing_version, "label")),
+        )
+        if accepted and label.strip():
+            version_id = _value(self._editing_version, "id")
+            self._start_worker(
+                lambda _: self.library.update_version(version_id, label=label.strip()),
+                lambda _: self.reload_projects(),
+                "Renaming version…",
+                mutating=True,
+            )
+
+    def _restore_layout(self):
+        view = self.menuBar().addMenu("View")
+        for name, widget, key in (
+            ("Filters", self.navigation_panel, "filtersVisible"),
+            ("Inspector", self.inspector_panel, "inspectorVisible"),
+        ):
+            action = QAction(name, self)
+            action.setCheckable(True)
+            visible = self.settings.value(key, True, type=bool)
+            action.setChecked(visible)
+            widget.setVisible(visible)
+            action.toggled.connect(widget.setVisible)
+            view.addAction(action)
+        geometry = self.settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        state = self.settings.value("splitter")
+        if state:
+            self.splitter.restoreState(state)
+        columns = self.settings.value("columns")
+        if columns:
+            self.project_table.horizontalHeader().restoreState(columns)
+        self.inspector_tabs.setCurrentIndex(
+            self.settings.value("inspectorTab", 0, type=int)
+        )
+
+    def _save_layout(self):
+        self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("splitter", self.splitter.saveState())
+        self.settings.setValue(
+            "columns", self.project_table.horizontalHeader().saveState()
+        )
+        self.settings.setValue("inspectorTab", self.inspector_tabs.currentIndex())
+        self.settings.setValue("filtersVisible", not self.navigation_panel.isHidden())
+        self.settings.setValue("inspectorVisible", not self.inspector_panel.isHidden())
 
     def _start_worker(
         self,
@@ -1196,6 +1568,10 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def reload_projects(self, selected_id: str | None = None) -> None:
+        if not self._confirm_pending_edits():
+            return
+        if self._editing_version:
+            self._restore_version_id = _value(self._editing_version, "id")
         self.search_timer.stop()
         self._search_generation += 1
         generation = self._search_generation
@@ -1207,7 +1583,7 @@ class MainWindow(QMainWindow):
         tuning = self._filter_value(self.tuning_filter)
         version_scope = self._filter_value(self.version_scope)
 
-        def search(_context: _JobContext) -> Any:
+        def search(_context: _JobContext, *, include_fuzzy=True) -> Any:
             return self.library.list_projects(
                 query=query,
                 engine=engine,
@@ -1216,18 +1592,48 @@ class MainWindow(QMainWindow):
                 voice=voice,
                 tuning=tuning,
                 version_scope=version_scope,
+                include_fuzzy=include_fuzzy,
             )
 
-        self._start_worker(
-            search,
-            lambda rows: self._accept_search(generation, rows, selected_id),
-            "Searching library…",
-        )
+        def strict_results(rows):
+            if generation != self._search_generation:
+                return
+            if rows:
+                self._accept_search(generation, rows, selected_id)
+            self._start_worker(
+                search,
+                lambda result: self._accept_search(generation, result, selected_id),
+                "Finding similar names…",
+            )
+
+        if len(query) >= 3:
+            self._start_worker(
+                lambda context: search(context, include_fuzzy=False),
+                strict_results,
+                "Searching library…",
+            )
+        else:
+            self._start_worker(
+                search,
+                lambda rows: self._accept_search(generation, rows, selected_id),
+                "Searching library…",
+            )
 
     def _accept_search(
         self, generation: int, rows: Any, selected_id: str | None = None
     ) -> None:
         if generation != self._search_generation:
+            return
+        if (
+            self._project_snapshot is not None
+            and self._project_values() != self._project_snapshot
+        ) or (
+            self._version_snapshot is not None
+            and self._version_values() != self._version_snapshot
+        ):
+            self.statusBar().showMessage(
+                "Save or discard your edits to update the search results.", 5000
+            )
             return
         try:
             projects = list(rows or [])
@@ -1242,10 +1648,17 @@ class MainWindow(QMainWindow):
     def _populate_projects(
         self, projects: list[Any], selected_id: str | None = None
     ) -> None:
-        target_selection = selected_id or _text(
-            _value(self._selected_project, "id", "project_id")
+        if not self._confirm_pending_edits():
+            return
+        selected_row = self.project_table.currentRow()
+        selected_item = (
+            self.project_table.item(selected_row, 0) if selected_row >= 0 else None
+        )
+        target_selection = selected_id or (
+            selected_item.data(Qt.ItemDataRole.UserRole) if selected_item else None
         )
         self.project_table.setSortingEnabled(False)
+        self.project_table.blockSignals(True)
         self.project_table.setRowCount(0)
         self._projects.clear()
 
@@ -1273,7 +1686,8 @@ class MainWindow(QMainWindow):
                     item.setData(Qt.ItemDataRole.UserRole, project_id)
                 self.project_table.setItem(row_index, column, item)
 
-        self.project_table.setSortingEnabled(True)
+        self.project_table.setSortingEnabled(False)
+        self.project_table.blockSignals(False)
         if projects:
             self.table_stack.setCurrentIndex(0)
             if target_selection and self._select_project_id(target_selection):
@@ -1345,7 +1759,9 @@ class MainWindow(QMainWindow):
             return None
         pref_id = _value(project, "preferred_version_id")
         for f in files:
-            if _value(f, "is_default_file") and (_value(f, "version_id") == pref_id or not pref_id):
+            if _value(f, "is_default_file") and (
+                _value(f, "version_id") == pref_id or not pref_id
+            ):
                 return _value(f, "path", "locator")
         for f in files:
             if _value(f, "version_id") == pref_id:
@@ -1373,6 +1789,35 @@ class MainWindow(QMainWindow):
             self._clear_inspector()
             return
 
+        if not self._loading_inspector and not self._confirm_pending_edits():
+            self.project_table.blockSignals(True)
+            self._select_project_id(_text(_value(self._selected_project, "id")))
+            self.project_table.blockSignals(False)
+            return
+        self._clear_inspector()
+        self._selection_generation += 1
+        generation = self._selection_generation
+        if hasattr(self.library, "database"):
+
+            def loaded(rows):
+                if generation != self._selection_generation or not rows:
+                    return
+                detail = rows[0]
+                detail["match_field"] = project.get("match_field")
+                detail["match_value"] = project.get("match_value")
+                detail["matching_file_ids"] = [f["id"] for f in _files(project)]
+                self._display_selected_project(detail)
+
+            self._start_worker(
+                lambda _: self.library.list_projects(project_id=project_id),
+                loaded,
+                "Loading project details…",
+            )
+        else:
+            self._display_selected_project(project)
+
+    def _display_selected_project(self, project):
+        self._loading_inspector = True
         self._selected_project = project
         self.name_edit.setText(_display_name(project))
         self.description_edit.setPlainText(_text(_value(project, "description")))
@@ -1381,9 +1826,15 @@ class MainWindow(QMainWindow):
                 _value(project, "status_name", "status_id", "status", "workflow_status")
             )
         )
-        aliases = _value(project, "editable_aliases") or _value(project, "aliases", default=[])
+        aliases = _value(project, "editable_aliases") or _value(
+            project, "aliases", default=[]
+        )
         self.aliases_edit.setPlainText("\n".join(_text(alias) for alias in aliases))
-        credit_records = _value(project, "editable_credit_records") or _value(project, "credit_records", default=[])
+        credit_records = [
+            r
+            for r in _value(project, "credit_records", default=[])
+            if _value(r, "scope", default="project") == "project"
+        ]
         if credit_records:
             credit_lines = [
                 f"{_text(_value(item, 'role'))}: {_text(_value(item, 'name'))}"
@@ -1398,18 +1849,25 @@ class MainWindow(QMainWindow):
         # Populate versions
         self.version_combo.blockSignals(True)
         self.version_combo.clear()
-        project_id = _text(_value(project, "id"))
-        versions = (
-            self.library.list_versions(project_id)
-            if hasattr(self.library, "list_versions")
-            else project.get("versions", [])
-        )
+        versions = project.get("versions", [])
+        # Empty versions are included by the detail loader.
         preferred_id = _value(project, "preferred_version_id")
+        actual_preferred_id = preferred_id
+        matching_ids = project.get("matching_file_ids")
+        visible_version_ids = {
+            _value(f, "version_id")
+            for f in _files(project)
+            if matching_ids is None or _value(f, "id") in matching_ids
+        }
+        if preferred_id not in visible_version_ids and visible_version_ids:
+            preferred_id = next(iter(visible_version_ids))
+        if self._restore_version_id in visible_version_ids:
+            preferred_id = self._restore_version_id
         selected_version_idx = 0
         for idx, ver in enumerate(versions):
             v_id = _value(ver, "id")
             label = _text(_value(ver, "label"), "Version")
-            if v_id == preferred_id:
+            if v_id == actual_preferred_id:
                 label += " (preferred)"
             self.version_combo.addItem(label, ver)
             if v_id == preferred_id:
@@ -1430,19 +1888,6 @@ class MainWindow(QMainWindow):
             self.vocadb_refresh_button.setEnabled(False)
             self.vocadb_unlink_button.setEnabled(False)
 
-        self.file_combo.blockSignals(True)
-        self.file_combo.clear()
-        for file_record in _files(project):
-            file_path = _text(
-                _value(file_record, "path", "locator", "file_path"), "Unnamed file"
-            )
-            v_label = _value(file_record, "version_label") or "Default"
-            name = Path(file_path).name or file_path
-            is_def = _value(file_record, "is_default_file")
-            label = f"[{v_label}] {name}" + (" (default)" if is_def else "")
-            self.file_combo.addItem(label, file_record)
-        self.file_combo.blockSignals(False)
-
         aliases = _value(project, "aliases", "song_names")
         credits = _value(project, "credits", "contributors")
         links = _value(project, "links")
@@ -1461,9 +1906,39 @@ class MainWindow(QMainWindow):
         if tags:
             details.append(f"Tags: {_text(tags)}")
         self.metadata_details.setText("\n".join(details))
+        self.match_evidence.setText(
+            f"Matched {match_field}: {_text(match_value)}"
+            if match_field and match_value
+            else ""
+        )
+        self.project_summary.setText(
+            _display_name(project)
+            + "\n"
+            + (_text(_value(project, "description")) or "No description")
+            + "\n"
+            + "Status: "
+            + (_text(_value(project, "status_name")) or "Not set")
+            + "\n"
+            + "Project credits: "
+            + (", ".join(credit_lines) or "Not set")
+        )
+        original = [
+            f"{r['role']}: {r['name']}"
+            for r in _value(project, "credit_records", default=[])
+            if r.get("scope") == "song"
+        ]
+        self.original_credits.setText(
+            "Original song credits\n" + ("\n".join(original) or "Not set")
+        )
+        self._project_snapshot = self._project_values()
+        self._version_snapshot = self._version_values()
+        self._loading_inspector = False
+        self._update_dirty_state()
         self._update_file_details()
 
     def _clear_inspector(self) -> None:
+        self._selection_generation += 1
+        self._loading_inspector = True
         self._selected_project = None
         self.name_edit.clear()
         self.description_edit.clear()
@@ -1480,19 +1955,72 @@ class MainWindow(QMainWindow):
         self.file_combo.clear()
         self.file_details.setText("Select a project to inspect its files.")
         self.metadata_details.clear()
+        self.file_list.clear()
+        self.file_problems.clear()
+        self.path_label.setPath("")
+        self.project_summary.setText("Select a project to view its metadata.")
+        self.original_credits.clear()
+        self.match_evidence.clear()
+        self._project_snapshot = self._version_snapshot = None
+        self._editing_version = None
+        self._loading_inspector = False
+        self._update_dirty_state()
+        self._update_file_details()
 
     @Slot()
     def _on_version_selected(self) -> None:
         ver = self.version_combo.currentData()
-        if ver:
-            self.version_notes_edit.setText(_text(_value(ver, "notes")))
-            self.version_terms_edit.setText(_text(_value(ver, "distribution_terms")))
-        else:
-            self.version_notes_edit.clear()
-            self.version_terms_edit.clear()
+        if not self._loading_inspector and not self._confirm_pending_edits():
+            self.version_combo.blockSignals(True)
+            for i in range(self.version_combo.count()):
+                if _value(self.version_combo.itemData(i), "id") == _value(
+                    self._editing_version, "id"
+                ):
+                    self.version_combo.setCurrentIndex(i)
+            self.version_combo.blockSignals(False)
+            return
+        loading = self._loading_inspector
+        self._loading_inspector = True
+        self._editing_version = ver
+        self.version_badge.setText(
+            "Preferred version" if _value(ver, "is_preferred") else ""
+        )
+        self.version_badge.setVisible(bool(self.version_badge.text()))
+        self.version_notes_edit.setText(_text(_value(ver, "notes")))
+        self.version_terms_edit.setText(_text(_value(ver, "distribution_terms")))
+        self._version_snapshot = self._version_values()
+        self.file_combo.blockSignals(True)
+        self.file_list.blockSignals(True)
+        self.file_combo.clear()
+        self.file_list.clear()
+        selected = 0
+        for file in _files(self._selected_project):
+            if ver and _value(file, "version_id") != _value(ver, "id"):
+                continue
+            path = _text(_value(file, "path", "locator"))
+            default = _value(file, "is_default_file")
+            label = Path(path).name + (" · Default" if default else "")
+            item = QListWidgetItem(label)
+            item.setToolTip(path)
+            self.file_list.addItem(item)
+            self.file_combo.addItem(label, file)
+            if default:
+                selected = self.file_combo.count() - 1
+        self.file_combo.setCurrentIndex(selected)
+        self.file_list.setCurrentRow(selected)
+        self.file_list.setFixedHeight(
+            min(140, max(44, self.file_list.count() * 28 + 8))
+        )
+        self.file_list.blockSignals(False)
+        self.file_combo.blockSignals(False)
+        self._loading_inspector = loading
+        self._update_file_details()
+        self._update_dirty_state()
 
     @Slot()
     def create_new_version(self) -> None:
+        if not self._confirm_pending_edits():
+            return
         if not self._selected_project:
             return
         project_id = _text(_value(self._selected_project, "id"))
@@ -1512,6 +2040,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def set_selected_preferred_version(self) -> None:
+        if not self._confirm_pending_edits():
+            return
         if not self._selected_project:
             return
         ver = self.version_combo.currentData()
@@ -1520,33 +2050,38 @@ class MainWindow(QMainWindow):
         project_id = _text(_value(self._selected_project, "id"))
         version_id = _text(_value(ver, "id"))
         self._start_worker(
-            lambda _context: self.library.set_preferred_version(
-                project_id, version_id
-            ),
+            lambda _context: self.library.set_preferred_version(project_id, version_id),
             lambda _result: self.reload_projects(project_id),
             "Updating preferred version…",
             mutating=True,
         )
 
     @Slot()
-    def save_selected_version(self) -> None:
-        if not self._selected_project:
-            return
-        ver = self.version_combo.currentData()
-        if not ver:
-            return
-        version_id = _text(_value(ver, "id"))
-        notes = self.version_notes_edit.text().strip()
-        terms = self.version_terms_edit.text().strip()
-        project_id = _text(_value(self._selected_project, "id"))
-        self._start_worker(
-            lambda _context: self.library.update_version(
-                version_id, notes=notes, distribution_terms=terms
-            ),
-            lambda _result: self.reload_projects(project_id),
-            "Saving version terms/notes…",
-            mutating=True,
-        )
+    def save_selected_version(self) -> bool:
+        version_id = _value(self._editing_version, "id")
+        if not version_id:
+            return True
+        try:
+            updated = {
+                **self._editing_version,
+                **self.library.update_version(
+                    version_id,
+                    notes=self.version_notes_edit.text(),
+                    distribution_terms=self.version_terms_edit.text(),
+                ),
+            }
+            self._editing_version = updated
+            for index in range(self.version_combo.count()):
+                if _value(self.version_combo.itemData(index), "id") == version_id:
+                    self.version_combo.setItemData(index, updated)
+                    break
+            self._version_snapshot = self._version_values()
+            self._update_dirty_state()
+            self.statusBar().showMessage("Version saved", 3000)
+            return True
+        except Exception as exc:  # noqa: BLE001 - service boundary.
+            self._show_error(str(exc))
+            return False
 
     @Slot()
     def set_selected_default_file(self) -> None:
@@ -1567,6 +2102,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def move_selected_file_to_version(self) -> None:
+        if not self._confirm_pending_edits():
+            return
         if not self._selected_project:
             return
         file_record = self._selected_file()
@@ -1602,13 +2139,19 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def group_selected_project(self) -> None:
+        if not self._confirm_pending_edits():
+            return
         if not self._selected_project:
             return
         current_id = _text(_value(self._selected_project, "id"))
         current_name = _text(_value(self._selected_project, "name", "project_name"))
-        other_projects = [
-            p for p in self._projects.values() if _value(p, "id") != current_id
-        ]
+        self._start_worker(
+            lambda _: self.library.list_grouping_candidates(current_id),
+            lambda rows: self._choose_group_target(current_id, current_name, rows),
+            "Loading grouping destinations…",
+        )
+
+    def _choose_group_target(self, current_id, current_name, other_projects):
         if not other_projects:
             QMessageBox.information(
                 self,
@@ -1621,9 +2164,7 @@ class MainWindow(QMainWindow):
             target_id = dlg.selected_target_id
             if target_id:
                 self._start_worker(
-                    lambda _context: self.library.group_projects(
-                        current_id, target_id
-                    ),
+                    lambda _context: self.library.group_projects(current_id, target_id),
                     lambda _result: self.reload_projects(target_id),
                     f"Grouping '{current_name}' into target project…",
                     mutating=True,
@@ -1631,6 +2172,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def enrich_selected_with_vocadb(self) -> None:
+        if not self._confirm_pending_edits():
+            return
         if not self._selected_project:
             return
         dlg = VocaDbDialog(self.library, self._selected_project, self)
@@ -1643,16 +2186,11 @@ class MainWindow(QMainWindow):
     def refresh_selected_vocadb(self) -> None:
         if not self._selected_project:
             return
-        project_id = _text(_value(self._selected_project, "id"))
-
-        def work(_context: Any) -> Any:
-            return self.library.refresh_vocadb(project_id)
-
-        def on_done(_result: Any) -> None:
-            self.reload_projects(project_id)
-            self.statusBar().showMessage("VocaDB metadata refreshed.", 3000)
-
-        self._start_worker(work, on_done, "Refreshing from VocaDB…", mutating=True)
+        if not self._confirm_pending_edits():
+            return
+        dlg = VocaDbDialog(self.library, self._selected_project, self, refresh=True)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.reload_projects(_text(_value(self._selected_project, "id")))
 
     @Slot()
     def unlink_selected_vocadb(self) -> None:
@@ -1674,48 +2212,38 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _update_file_details(self) -> None:
-        file_record = self._selected_file()
-        if file_record is None:
+        file = self._selected_file()
+        if not file:
             self.file_details.setText(
-                "No registered file is available for this project."
+                "This version has no files. Move a file here from another version."
+                if self._selected_project
+                else "Select a project to inspect its files."
             )
-            return
-        path = _text(
-            _value(file_record, "path", "locator", "file_path"), "Unknown path"
-        )
-        file_format = _text(
-            _value(file_record, "format_name", "engine", "file_format"), "unknown"
-        )
-        format_version = _text(_value(file_record, "format_version"), "unknown")
-        parse_status = _text(
-            _value(file_record, "parse_status", "status"), "not parsed"
-        )
-        health = _text(_value(file_record, "health", "health_status"), "unknown")
-        tempo = _value(file_record, "tempo", "initial_bpm", "bpm")
-        voice = _value(file_record, "voice", "voice_name", "voices")
-        lines = [
-            path,
-            f"Format: {file_format} {format_version}",
-            f"Parse: {parse_status.replace('_', ' ')}",
-            f"Health (last checked): {health.replace('_', ' ')}",
-        ]
-        if tempo is not None:
-            lines.append(f"Tempo: {_text(tempo)}")
-        if voice:
-            lines.append(f"Voice: {_text(voice)}")
-        warnings = _value(file_record, "warnings", "parse_warnings")
-        if warnings:
-            lines.append(f"Warnings: {_text(warnings)}")
-        details = _value(file_record, "details", "parse_details")
-        if details:
-            if isinstance(details, Mapping):
-                detail_text = ", ".join(
-                    f"{key}: {_text(value)}" for key, value in details.items()
-                )
-            else:
-                detail_text = _text(details)
-            lines.append(f"Details: {detail_text}")
-        self.file_details.setText("\n".join(lines))
+            self.path_label.setPath("")
+            self.file_problems.clear()
+        else:
+            self.path_label.setPath(_text(_value(file, "path", "locator")))
+            tempo = _value(file, "tempo", "initial_bpm")
+            tracks = _value(file, "details", default={}).get("Tracks", "Unknown")
+            self.file_details.setText(
+                f"{_text(_value(file, 'format_name')).upper()} · {_text(_value(file, 'parse_status')).replace('_', ' ')}\n"
+                f"Tempo: {tempo if tempo is not None else 'Unknown'} · Tracks: {tracks}\n"
+                f"Voice: {_text(_value(file, 'voices')) or 'Unknown'}"
+            )
+            issues = list(_value(file, "warnings", default=[]))
+            health = _value(file, "health")
+            if health not in ("available", None):
+                issues.insert(0, "File status: " + _text(health))
+            self.file_problems.setText("\n".join(issues[:3]))
+            self.file_problems.setVisible(bool(issues))
+        for widget in (
+            self.open_file_button,
+            self.reveal_file_button,
+            self.file_more_button,
+            self.refresh_button,
+            self.relink_button,
+        ):
+            widget.setEnabled(bool(file))
 
     @Slot()
     def import_files(self) -> None:
@@ -1765,15 +2293,15 @@ class MainWindow(QMainWindow):
         self.reload_projects()
 
     @Slot()
-    def save_project(self) -> None:
+    def save_project(self, *, reload: bool = True) -> bool:
         if self._mutation_jobs:
             self.statusBar().showMessage(
                 "Wait for the current library operation to finish.", 5000
             )
-            return
+            return False
         project_id = _value(self._selected_project, "id", "project_id")
         if project_id is None:
-            return
+            return False
         credits: list[tuple[str, str]] = []
         for line in self.credits_edit.toPlainText().splitlines():
             if not line.strip():
@@ -1781,7 +2309,7 @@ class MainWindow(QMainWindow):
             role, separator, contributor = line.partition(":")
             if not separator or not role.strip() or not contributor.strip():
                 self._show_error("Each credit must use 'role: contributor'.")
-                return
+                return False
             credits.append((role.strip(), contributor.strip()))
         aliases = [
             line.strip() for line in self.aliases_edit.toPlainText().splitlines()
@@ -1799,9 +2327,13 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:  # noqa: BLE001 - service boundary.
             self._show_error(str(exc) or exc.__class__.__name__)
-            return
+            return False
         self.statusBar().showMessage("Project saved", 4000)
-        self.reload_projects()
+        self._project_snapshot = self._project_values()
+        self._update_dirty_state()
+        if reload:
+            self.reload_projects()
+        return True
 
     @Slot()
     def refresh_selected_file(self) -> None:
@@ -1841,6 +2373,16 @@ class MainWindow(QMainWindow):
     @Slot()
     def open_selected_file(self) -> None:
         self._run_file_action("open_file", "Opened file")
+
+    def open_table_project(self, index):
+        item = self.project_table.item(index.row(), 0)
+        if item:
+            project_id = item.data(Qt.ItemDataRole.UserRole)
+            self._start_worker(
+                lambda _: self.library.open_project(project_id),
+                lambda _: self.statusBar().showMessage("Opened preferred file", 3000),
+                "Opening preferred file…",
+            )
 
     @Slot()
     def open_selected_file_with(self) -> None:
@@ -1994,6 +2536,10 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if not self._confirm_pending_edits():
+            event.ignore()
+            return
+        self._save_layout()
         if self._active_jobs:
             self._closing_when_idle = True
             for context in self._jobs.values():
@@ -2018,4 +2564,4 @@ def apply_application_style(app: QApplication) -> None:
     """Apply small cross-platform defaults without imposing a fixed theme."""
     app.setApplicationName("VocaVault")
     app.setOrganizationName("VocaVault")
-    app.setStyle('Fusion')
+    app.setStyle("Fusion")

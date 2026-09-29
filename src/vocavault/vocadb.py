@@ -8,7 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Final
 
 VOCADB_BASE_URL: Final = "https://vocadb.net/api"
@@ -55,10 +55,12 @@ class VocaDbCandidate:
         names_list: list[dict[str, str]] = []
         for n in data.get("names", []):
             if isinstance(n, dict) and n.get("value"):
-                names_list.append({
-                    "value": str(n["value"]).strip(),
-                    "language": str(n.get("language", "Unspecified")),
-                })
+                names_list.append(
+                    {
+                        "value": str(n["value"]).strip(),
+                        "language": str(n.get("language", "Unspecified")),
+                    }
+                )
 
         artists_list: list[dict[str, Any]] = []
         for a in data.get("artists", []):
@@ -68,28 +70,34 @@ class VocaDbCandidate:
                 roles = str(a.get("roles", ""))
                 categories = str(a.get("categories", ""))
                 if art_name:
-                    artists_list.append({
-                        "name": str(art_name).strip(),
-                        "roles": roles,
-                        "categories": categories,
-                        "is_support": bool(a.get("isSupport", False)),
-                    })
+                    artists_list.append(
+                        {
+                            "name": str(art_name).strip(),
+                            "roles": roles,
+                            "categories": categories,
+                            "is_support": bool(a.get("isSupport", False)),
+                        }
+                    )
 
         links_list: list[dict[str, str]] = []
         for pv in data.get("pvs", []):
             if isinstance(pv, dict) and pv.get("url"):
-                links_list.append({
-                    "kind": str(pv.get("service", "media")).lower(),
-                    "url": str(pv["url"]).strip(),
-                    "label": str(pv.get("name") or pv.get("service") or "PV"),
-                })
+                links_list.append(
+                    {
+                        "kind": str(pv.get("service", "media")).lower(),
+                        "url": str(pv["url"]).strip(),
+                        "label": str(pv.get("name") or pv.get("service") or "PV"),
+                    }
+                )
         for wl in data.get("webLinks", []):
             if isinstance(wl, dict) and wl.get("url"):
-                links_list.append({
-                    "kind": "web",
-                    "url": str(wl["url"]).strip(),
-                    "label": str(wl.get("description") or "Web Link"),
-                })
+                links_list.append(
+                    {
+                        "kind": "web",
+                        "url": str(wl["url"]).strip(),
+                        "label": str(wl.get("description") or "Web Link"),
+                    }
+                )
 
         return cls(
             id=song_id,
@@ -120,7 +128,9 @@ class VocaDbClient:
         self.user_agent = user_agent
         self.cache_connection = cache_connection
 
-    def search_songs(self, query: str, *, max_results: int = 10) -> list[VocaDbCandidate]:
+    def search_songs(
+        self, query: str, *, max_results: int = 10
+    ) -> list[VocaDbCandidate]:
         clean_query = query.strip()
         if not clean_query:
             return []
@@ -151,12 +161,14 @@ class VocaDbClient:
                 return [VocaDbCandidate.from_api_dict(item) for item in items]
             raise
 
-    def get_song(self, song_id: int) -> VocaDbCandidate | None:
+    def get_song(
+        self, song_id: int, *, force_refresh: bool = False
+    ) -> VocaDbCandidate | None:
         cache_key = f"song:{song_id}"
         url = f"{self.base_url}/songs/{song_id}?fields=Names,Artists,PVs,WebLinks"
 
         cached = self._read_cache(cache_key)
-        if cached is not None:
+        if cached is not None and not force_refresh:
             return VocaDbCandidate.from_api_dict(cached)
 
         try:
@@ -166,7 +178,7 @@ class VocaDbClient:
         except VocaDbNotFoundError:
             return None
         except VocaDbNetworkError:
-            if cached is not None:
+            if cached is not None and not force_refresh:
                 return VocaDbCandidate.from_api_dict(cached)
             raise
 
@@ -186,7 +198,9 @@ class VocaDbClient:
             if exc.code == 404:
                 raise VocaDbNotFoundError(f"VocaDB resource not found: {url}") from exc
             if exc.code == 429:
-                raise VocaDbRateLimitError("VocaDB rate limit reached. Please wait a moment.") from exc
+                raise VocaDbRateLimitError(
+                    "VocaDB rate limit reached. Please wait a moment."
+                ) from exc
             raise VocaDbError(f"VocaDB HTTP error {exc.code}: {exc.reason}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise VocaDbNetworkError(f"Could not connect to VocaDB: {exc}") from exc
@@ -213,7 +227,7 @@ class VocaDbClient:
         if self.cache_connection is None:
             return
         try:
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(UTC).isoformat()
             self.cache_connection.execute(
                 """
                 INSERT OR REPLACE INTO api_cache(cache_key, endpoint, query_or_id, response_json, cached_at)

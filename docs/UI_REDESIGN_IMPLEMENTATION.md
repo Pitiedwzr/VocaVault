@@ -1,5 +1,9 @@
 # UI Redesign: Implementation Log
 
+This records the initial redesign. The inspector and enrichment interactions were
+subsequently revised; see [the follow-up log](V0_2_FOLLOWUP.md) for the current
+behavior and validation.
+
 This document records the UI improvements applied after the v0.2 release,
 targeting the crowding and discoverability issues identified in the UI plan.
 

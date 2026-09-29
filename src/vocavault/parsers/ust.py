@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any, Final
@@ -58,7 +59,7 @@ def _clean_voice_name(voice_dir: str) -> str:
 
 class UstParser(ProjectParser):
     parser_id = "builtin.ust"
-    parser_version = "0.2.0"
+    parser_version = "0.2.1"
 
     def detect(self, path: str | Path) -> Detection:
         source = Path(path)
@@ -95,7 +96,10 @@ class UstParser(ProjectParser):
                 parser_version=self.parser_version,
                 status=ParseStatus.UNSUPPORTED,
                 detection=detection,
-                warnings=(detection.evidence or "file is not recognized as a supported UST project",),
+                warnings=(
+                    detection.evidence
+                    or "file is not recognized as a supported UST project",
+                ),
             )
         try:
             raw_data = self._read_stable(source)
@@ -147,14 +151,20 @@ class UstParser(ProjectParser):
         out_file = settings.get("OutFile", "")
         cache_dir = settings.get("CacheDir", "")
 
+        warnings: list[str] = []
         try:
-            initial_bpm = float(settings.get("Tempo", 120.0))
+            initial_bpm = float(settings.get("Tempo", ""))
+            if not math.isfinite(initial_bpm) or initial_bpm <= 0:
+                raise ValueError("invalid tempo")
         except ValueError:
-            initial_bpm = 120.0
+            initial_bpm = None
+            warnings.append("Initial tempo is missing or invalid.")
 
-        tempo_events: list[dict[str, Any]] = [{"position": 0, "bpm": initial_bpm}]
+        tempo_events: list[dict[str, Any]] = (
+            [{"position": 0, "bpm": initial_bpm}] if initial_bpm else []
+        )
         current_position = 0
-        all_bpms: list[float] = [initial_bpm]
+        all_bpms: list[float] = [initial_bpm] if initial_bpm else []
 
         note_keys = [k for k in section_order if _NOTE_SEC_RE.match(k)]
         vocal_notes = 0
@@ -181,25 +191,33 @@ class UstParser(ProjectParser):
             if note_tempo_str:
                 try:
                     note_bpm = float(note_tempo_str)
+                    if not math.isfinite(note_bpm) or note_bpm <= 0:
+                        raise ValueError("invalid tempo")
+                    if len(tempo_events) >= self.limits.max_tempo_entries:
+                        return self._failed(
+                            detection, "tempo entries count exceeds limit"
+                        )
                     tempo_events.append({"position": current_position, "bpm": note_bpm})
                     all_bpms.append(note_bpm)
                 except ValueError:
                     pass
 
             lyric = note.get("Lyric", "").strip()
-            is_rest = lyric.casefold() == "r" or not lyric
+            is_rest = lyric.casefold() == "r"
             if not is_rest:
                 vocal_notes += 1
-                lyric_count += 1
+                lyric_count += bool(lyric)
                 lyric_texts.append(lyric)
 
             has_pitch = False
             pby = note.get("PBY", "")
-            if pby and any(val not in ("", "0", "0.0") for val in pby.split(",")):
-                has_pitch = True
-            elif note.get("PBType") or note.get("PBDs") or note.get("PitchBend"):
-                has_pitch = True
-            elif note.get("PBS") and ";" in note.get("PBS", ""):
+            if (
+                pby
+                and any(val not in ("", "0", "0.0") for val in pby.split(","))
+                or any(note.get(key) for key in ("Piches", "Pitches", "PitchBend"))
+                or note.get("PBS")
+                and ";" in note.get("PBS", "")
+            ):
                 has_pitch = True
             if has_pitch:
                 pitch_detected = True
@@ -209,7 +227,7 @@ class UstParser(ProjectParser):
             if vbr:
                 vbr_parts = vbr.split(",")
                 try:
-                    if float(vbr_parts[0]) > 0 or (
+                    if float(vbr_parts[0]) > 0 and (
                         len(vbr_parts) > 2 and float(vbr_parts[2]) > 0
                     ):
                         vibrato_detected = True
@@ -219,16 +237,13 @@ class UstParser(ProjectParser):
                     vibrato_count += 1
 
             env = note.get("Envelope", "")
-            if env:
-                dynamics_detected = True
-                dynamics_count += 1
-            elif note.get("Intensity") and note.get("Intensity") != "100":
+            if env or note.get("Intensity") and note.get("Intensity") != "100":
                 dynamics_detected = True
                 dynamics_count += 1
 
             current_position += length
 
-        tempo_change_count = len(tempo_events) - 1
+        tempo_change_count = max(0, len(tempo_events) - 1)
         tempo_summary = TempoSummary(
             initial_bpm=initial_bpm,
             minimum_bpm=min(all_bpms) if all_bpms else initial_bpm,
@@ -260,8 +275,12 @@ class UstParser(ProjectParser):
             note_count=vocal_notes,
             lyric_count=lyric_count,
             pitch=SignalState.DETECTED if pitch_detected else SignalState.NONE_DETECTED,
-            vibrato=SignalState.DETECTED if vibrato_detected else SignalState.NONE_DETECTED,
-            dynamics=SignalState.DETECTED if dynamics_detected else SignalState.NONE_DETECTED,
+            vibrato=SignalState.DETECTED
+            if vibrato_detected
+            else SignalState.NONE_DETECTED,
+            dynamics=SignalState.DETECTED
+            if dynamics_detected
+            else SignalState.NONE_DETECTED,
             details={
                 "encoding": encoding,
                 "total_sections": len(note_keys),
@@ -277,12 +296,20 @@ class UstParser(ProjectParser):
         return ParseResult(
             parser_id=self.parser_id,
             parser_version=self.parser_version,
-            status=ParseStatus.PARSED,
+            status=ParseStatus.PARTIAL if warnings else ParseStatus.PARSED,
             detection=Detection(True, "ust", version, detection.evidence),
-            capabilities=("tempo", "tracks", "voices", "lyrics", "tuning", "references"),
+            capabilities=(
+                "tempo",
+                "tracks",
+                "voices",
+                "lyrics",
+                "tuning",
+                "references",
+            ),
             tempo=tempo_summary,
             tracks=(track_summary,),
             references=tuple(references),
+            warnings=tuple(warnings),
             details={
                 "encoding": encoding,
                 "project_name": project_name,

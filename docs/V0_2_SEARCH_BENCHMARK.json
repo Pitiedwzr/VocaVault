@@ -1,0 +1,36 @@
+{
+  "platform": "Windows-11-10.0.26200-SP0",
+  "processor": "AMD64 Family 25 Model 68 Stepping 1, AuthenticAMD",
+  "python": "3.13.5",
+  "projects": 10000,
+  "files": 50000,
+  "aliases": 100000,
+  "rebuild_seconds": 5.73,
+  "measurements": {
+    "exact": {
+      "first_ms": 68.56,
+      "warm_median_ms": 32.74,
+      "warm_max_ms": 33.11,
+      "results": 1
+    },
+    "typo": {
+      "first_ms": 447.35,
+      "warm_median_ms": 362.51,
+      "warm_max_ms": 448.44,
+      "results": 1
+    },
+    "short_cjk": {
+      "first_ms": 226.46,
+      "warm_median_ms": 199.2,
+      "warm_max_ms": 237.57,
+      "results": 1
+    },
+    "filter": {
+      "first_ms": 124.27,
+      "warm_median_ms": 128.69,
+      "warm_max_ms": 150.37,
+      "results": 0
+    }
+  },
+  "note": "First query follows index rebuild; this is not a cold filesystem-cache measurement. Five warm samples; max is reported, not a statistically robust p95."
+}

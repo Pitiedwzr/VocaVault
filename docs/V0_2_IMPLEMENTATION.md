@@ -1,5 +1,9 @@
 # v0.2 implementation and validation
 
+This records the initial implementation. The subsequent review found correctness
+and validation gaps; see [the follow-up log](V0_2_FOLLOWUP.md) for the fixes,
+current evidence, and remaining release limitations.
+
 This is the second milestone release of VocaVault, implementing the retrieval,
 external enrichment, project grouping, and editor integration requirements
 specified in `PLAN.md`.

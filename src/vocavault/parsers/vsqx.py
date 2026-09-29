@@ -24,7 +24,11 @@ from vocavault.parsers.base import (
     SourceChangedError,
 )
 
-_HEADER_MAGIC = re.compile(rb"<(?:vsq3|vsq4)[\s>]|vocaloid/schema/vsq[34]/", re.IGNORECASE)
+from .vsqx_schema import CONTROLLERS, VSQ3_TAGS
+
+_HEADER_MAGIC = re.compile(
+    rb"<(?:vsq3|vsq4)[\s>]|vocaloid/schema/vsq[34]/", re.IGNORECASE
+)
 _RESOLUTION_DEFAULT: Final = 480
 
 _HIRAGANA_KATAKANA = re.compile(r"[\u3040-\u30ff]")
@@ -66,7 +70,7 @@ def _find_text(elem: ET.Element, name: str, default: str = "") -> str:
 
 class VsqxParser(ProjectParser):
     parser_id = "builtin.vsqx"
-    parser_version = "0.2.0"
+    parser_version = "0.2.1"
 
     def detect(self, path: str | Path) -> Detection:
         source = Path(path)
@@ -84,9 +88,15 @@ class VsqxParser(ProjectParser):
                 evidence=".vsqx extension without recognized VOCALOID XML header",
             )
 
-        version_match = re.search(r"<version>\s*(?:<!\[CDATA\[)?\s*([0-9.]+)", header.decode("latin1", errors="replace"), re.IGNORECASE)
+        version_match = re.search(
+            r"<version>\s*(?:<!\[CDATA\[)?\s*([0-9.]+)",
+            header.decode("latin1", errors="replace"),
+            re.IGNORECASE,
+        )
         version = version_match.group(1) if version_match else None
-        root_match = re.search(r"<(vsq[34])[\s>]", header.decode("latin1", errors="replace"), re.IGNORECASE)
+        root_match = re.search(
+            r"<(vsq[34])[\s>]", header.decode("latin1", errors="replace"), re.IGNORECASE
+        )
         schema_tag = root_match.group(1).lower() if root_match else "vsqx"
         evidence = f"VOCALOID project file ({schema_tag})"
         if version:
@@ -102,7 +112,10 @@ class VsqxParser(ProjectParser):
                 parser_version=self.parser_version,
                 status=ParseStatus.UNSUPPORTED,
                 detection=detection,
-                warnings=(detection.evidence or "file is not recognized as a supported VSQX project",),
+                warnings=(
+                    detection.evidence
+                    or "file is not recognized as a supported VSQX project",
+                ),
             )
 
         try:
@@ -115,8 +128,10 @@ class VsqxParser(ProjectParser):
             return self._failed(detection, str(exc))
 
         try:
-            root = ET.fromstring(raw_data)
-        except (ET.ParseError, ValueError) as exc:
+            root = ET.fromstring(
+                raw_data, parser=ET.XMLParser(target=_BoundedTree(self.limits))
+            )
+        except (ET.ParseError, ValueError, ParserError) as exc:
             return self._failed(detection, f"malformed XML: {exc}")
 
         root_name = _strip_ns(root.tag).lower()
@@ -125,11 +140,18 @@ class VsqxParser(ProjectParser):
                 parser_id=self.parser_id,
                 parser_version=self.parser_version,
                 status=ParseStatus.UNSUPPORTED,
-                detection=Detection(False, "vsqx", None, f"unsupported root tag {root_name}"),
+                detection=Detection(
+                    False, "vsqx", None, f"unsupported root tag {root_name}"
+                ),
                 warnings=(f"unsupported root tag {root_name}",),
             )
 
         schema_version = _find_text(root, "version") or detection.format_version
+        if root_name == "vsq3":
+            for element in root.iter():
+                tag = _strip_ns(element.tag)
+                element.tag = VSQ3_TAGS.get(tag, tag)
+        warnings: list[str] = []
 
         # Build voice lookup table from vVoiceTable
         voices: dict[tuple[str, str], tuple[str, str]] = {}
@@ -139,7 +161,7 @@ class VsqxParser(ProjectParser):
                 bs = _find_text(vvoice, "bs")
                 pc = _find_text(vvoice, "pc")
                 name = _find_text(vvoice, "name")
-                vid = _find_text(vvoice, "id")
+                vid = _find_text(vvoice, "id") or _find_text(vvoice, "compID")
                 voices[(bs, pc)] = (name, vid)
 
         # Parse masterTrack (tempo, resolution)
@@ -162,16 +184,22 @@ class VsqxParser(ProjectParser):
 
             for t_elem in tempos:
                 pos_str = _find_text(t_elem, "t", "0")
-                val_str = _find_text(t_elem, "v", "12000")
+                val_str = _find_text(t_elem, "v")
                 try:
                     pos = int(pos_str)
                     bpm = round(int(val_str) / 100.0, 2)
+                    if bpm <= 0:
+                        raise ValueError("nonpositive tempo")
                     tempo_events.append({"position": pos, "bpm": bpm})
                     all_bpms.append(bpm)
                 except ValueError:
+                    warnings.append("Invalid tempo entry; value remains unknown.")
                     continue
 
-        initial_bpm = all_bpms[0] if all_bpms else 120.0
+        tempo_events.sort(key=lambda event: event["position"])
+        initial_bpm = tempo_events[0]["bpm"] if tempo_events else None
+        if not tempo_events:
+            warnings.append("No valid tempo entries.")
         change_count = max(0, len(tempo_events) - 1)
         tempo_summary = TempoSummary(
             initial_bpm=initial_bpm,
@@ -230,9 +258,12 @@ class VsqxParser(ProjectParser):
                     for v in _find_children(pstyle, "v"):
                         vid = v.attrib.get("id")
                         vtext = (v.text or "").strip()
-                        if vid == "bendDep" and vtext not in ("", "0", "8"):
-                            pitch_detected = True
-                        elif vid in ("risePort", "fallPort") and vtext not in ("", "0"):
+                        if (
+                            vid == "bendDep"
+                            and vtext not in ("", "0", "8")
+                            or vid in ("risePort", "fallPort")
+                            and vtext not in ("", "0")
+                        ):
                             pitch_detected = True
 
                 notes = _find_children(part, "note")
@@ -255,7 +286,12 @@ class VsqxParser(ProjectParser):
                         for v in _find_children(nstyle, "v"):
                             vid = v.attrib.get("id")
                             vval = (v.text or "").strip()
-                            if vid in ("bendDep", "bendLen", "risePort", "fallPort") and vval not in ("", "0"):
+                            if vid in (
+                                "bendDep",
+                                "bendLen",
+                                "risePort",
+                                "fallPort",
+                            ) and vval not in ("", "0"):
                                 pitch_detected = True
                                 pitch_count += 1
                             elif vid in ("vibLen", "vibType") and vval not in ("", "0"):
@@ -273,6 +309,16 @@ class VsqxParser(ProjectParser):
                         if "vib" in sid.lower():
                             vibrato_detected = True
                             vibrato_count += len(_find_children(child, "cc"))
+                    elif c_tag == "cc":
+                        value = _find_child(child, "v")
+                        if value is not None and (value.text or "").strip():
+                            signal = CONTROLLERS.get(value.attrib.get("id", ""))
+                            if signal == "pitch":
+                                pitch_detected = True
+                                pitch_count += 1
+                            elif signal == "dynamics":
+                                dynamics_detected = True
+                                dynamics_count += 1
                     elif c_tag in ("bre", "bri", "cle", "gen", "ope", "vol"):
                         dynamics_detected = True
                         dynamics_count += 1
@@ -293,9 +339,15 @@ class VsqxParser(ProjectParser):
                     languages=languages,
                     note_count=track_note_count,
                     lyric_count=track_lyric_count,
-                    pitch=SignalState.DETECTED if pitch_detected else SignalState.NONE_DETECTED,
-                    vibrato=SignalState.DETECTED if vibrato_detected else SignalState.NONE_DETECTED,
-                    dynamics=SignalState.DETECTED if dynamics_detected else SignalState.NONE_DETECTED,
+                    pitch=SignalState.DETECTED
+                    if pitch_detected
+                    else SignalState.NONE_DETECTED,
+                    vibrato=SignalState.DETECTED
+                    if vibrato_detected
+                    else SignalState.NONE_DETECTED,
+                    dynamics=SignalState.DETECTED
+                    if dynamics_detected
+                    else SignalState.NONE_DETECTED,
                     details={
                         "voices": [{"name": n, "id": i} for n, i in part_voices],
                         "signal_counts": {
@@ -311,7 +363,11 @@ class VsqxParser(ProjectParser):
         for container_name in ("monoTrack", "stTrack"):
             for at in _find_children(root, container_name):
                 at_name = _find_text(at, "name", "Audio Track")
-                wav_parts = at.findall(".//{*}wavPart") if "}" in root.tag else at.findall(".//wavPart")
+                wav_parts = (
+                    at.findall(".//{*}wavPart")
+                    if "}" in root.tag
+                    else at.findall(".//wavPart")
+                )
                 if not wav_parts:
                     # Fallback child search
                     wav_parts = [c for c in at.iter() if _strip_ns(c.tag) == "wavPart"]
@@ -319,7 +375,9 @@ class VsqxParser(ProjectParser):
                 for wp in wav_parts:
                     fp = _find_text(wp, "filePath")
                     if fp:
-                        references.append(DependencyReference(original=fp, kind="audio"))
+                        references.append(
+                            DependencyReference(original=fp, kind="audio")
+                        )
 
                 if wav_parts:
                     tracks.append(
@@ -335,12 +393,20 @@ class VsqxParser(ProjectParser):
         return ParseResult(
             parser_id=self.parser_id,
             parser_version=self.parser_version,
-            status=ParseStatus.PARSED,
+            status=ParseStatus.PARTIAL if warnings else ParseStatus.PARSED,
             detection=Detection(True, "vsqx", schema_version, detection.evidence),
-            capabilities=("tempo", "tracks", "voices", "lyrics", "tuning", "references"),
+            capabilities=(
+                "tempo",
+                "tracks",
+                "voices",
+                "lyrics",
+                "tuning",
+                "references",
+            ),
             tempo=tempo_summary,
             tracks=tuple(tracks),
             references=tuple(references),
+            warnings=tuple(warnings),
             details={
                 "schema": root_name,
                 "version": schema_version,
@@ -362,3 +428,32 @@ class VsqxParser(ProjectParser):
             detection=detection,
             warnings=(warning,),
         )
+
+
+class _BoundedTree(ET.TreeBuilder):
+    """Reject DTDs and enforce structural limits while XML is built."""
+
+    def __init__(self, limits):
+        super().__init__()
+        self.limits = limits
+        self.depth = self.notes = self.curves = 0
+
+    def doctype(self, name, pubid, system):
+        raise ParserError("XML DTDs and entities are not supported")
+
+    def start(self, tag, attrs):
+        self.depth += 1
+        if self.depth > self.limits.max_json_depth:
+            raise ParserLimitError("XML nesting exceeds limit")
+        local = _strip_ns(tag)
+        self.notes += local == "note"
+        self.curves += local in ("cc", "mCtrl")
+        if self.notes > self.limits.max_notes:
+            raise ParserLimitError("note count exceeds limit")
+        if self.curves > self.limits.max_curve_values:
+            raise ParserLimitError("controller count exceeds limit")
+        return super().start(tag, attrs)
+
+    def end(self, tag):
+        self.depth -= 1
+        return super().end(tag)

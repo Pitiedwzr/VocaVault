@@ -16,9 +16,11 @@ from .database import Database, new_id, transaction
 from .fileops import FileFingerprint, fingerprint, open_path, reveal_path
 from .models import Detection, ParseResult, ParseStatus
 from .normalization import normalize_search_text
+from .search import candidate_projects, load_vocabulary
 
 try:
     from rapidfuzz import fuzz
+
     _HAS_RAPIDFUZZ = True
 except ImportError:
     _HAS_RAPIDFUZZ = False
@@ -88,6 +90,7 @@ class LibraryService:
         self._write_lock = RLock()
         self.database = Database(database_path)
         self.database.initialize()
+        self._search_vocabulary = None
 
     def close(self) -> None:
         """Present for UI lifecycle symmetry; connections are short-lived."""
@@ -702,6 +705,7 @@ class LibraryService:
             "parse_status": parse_status,
         }
 
+    @_serialized_write
     def list_projects(
         self,
         query: str = "",
@@ -711,13 +715,71 @@ class LibraryService:
         voice: str | None = None,
         tuning: str | None = None,
         version_scope: str = "all",
+        project_id: str | None = None,
+        include_fuzzy: bool = True,
     ) -> list[dict[str, Any]]:
         if version_scope not in {"all", "preferred"}:
             raise LibraryError("Version scope must be 'all' or 'preferred'.")
+        requested_project_id = project_id
+        with self.database.connection() as connection:
+            if connection.execute("SELECT dirty FROM search_index_state").fetchone()[0]:
+                self.rebuild_search_index()
+        normalized_query = normalize_search_text(query)
         with (
             self.database.connection(readonly=True) as connection,
             transaction(connection),
         ):
+            if (
+                include_fuzzy
+                and self._search_vocabulary is None
+                and len(normalized_query) >= 3
+            ):
+                self._search_vocabulary = load_vocabulary(connection)
+            candidate_ids = (
+                candidate_projects(
+                    connection,
+                    normalized_query,
+                    self._search_vocabulary or {},
+                    include_fuzzy=include_fuzzy,
+                )
+                if normalized_query
+                else None
+            )
+            if project_id is not None:
+                candidate_ids = (
+                    {project_id}
+                    if candidate_ids is None
+                    else candidate_ids & {project_id}
+                )
+            connection.execute(
+                "CREATE TEMP TABLE selected_projects AS SELECT * FROM projects WHERE ? IS NULL OR id IN (SELECT value FROM json_each(?))",
+                (
+                    None if candidate_ids is None else 1,
+                    json.dumps(list(candidate_ids or [])),
+                ),
+            )
+            if engine:
+                connection.execute(
+                    """DELETE FROM selected_projects WHERE id NOT IN (
+                    SELECT v.project_id FROM files f JOIN versions v ON v.id=f.version_id
+                    WHERE lower(f.detected_format)=lower(?)
+                    UNION SELECT v.project_id FROM file_tracks ft
+                    JOIN parse_observations po ON po.id=ft.observation_id
+                    JOIN files f ON f.id=po.file_id JOIN versions v ON v.id=f.version_id
+                    WHERE lower(ft.engine)=lower(?))""",
+                    (engine, engine),
+                )
+            connection.execute(
+                "CREATE UNIQUE INDEX temp.selected_project_id ON selected_projects(id)"
+            )
+            connection.execute(
+                "CREATE INDEX temp.selected_song_id ON selected_projects(song_id)"
+            )
+            connection.execute("ANALYZE temp.selected_projects")
+            if not connection.execute(
+                "SELECT 1 FROM selected_projects LIMIT 1"
+            ).fetchone():
+                return []
             rows = connection.execute(
                 """
                 SELECT p.id AS project_id, p.name AS project_name, p.description,
@@ -733,7 +795,7 @@ class LibraryService:
                        o.minimum_bpm, o.maximum_bpm, o.tempo_change_count,
                        o.lyric_note_count, o.populated_lyric_count, o.warnings_json,
                        o.id AS observation_id
-                  FROM projects p
+                  FROM selected_projects p
                   LEFT JOIN songs s ON s.id = p.song_id
                   LEFT JOIN workflow_statuses ws ON ws.id = p.workflow_status_id
                   JOIN versions v ON v.project_id = p.id
@@ -755,6 +817,12 @@ class LibraryService:
                        ft.pitch_state, ft.vibrato_state, ft.dynamics_state,
                        ft.details_json
                   FROM file_tracks ft
+                  JOIN parse_observations po ON po.id = ft.observation_id
+                  JOIN files f ON f.id = po.file_id
+                  JOIN versions v ON v.id = f.version_id
+                  JOIN selected_projects p ON p.id = v.project_id
+                 WHERE po.id = (SELECT id FROM parse_observations WHERE file_id = f.id
+                                ORDER BY is_stale ASC, observed_at DESC LIMIT 1)
                 """
             ).fetchall()
 
@@ -876,6 +944,12 @@ class LibraryService:
                 ),
                 *((5, "voice", item, normalize_search_text(item)) for item in voices),
                 (
+                    4,
+                    "version",
+                    row["version_label"],
+                    normalize_search_text(row["version_label"]),
+                ),
+                (
                     6,
                     "filename",
                     Path(row["locator"]).name,
@@ -888,21 +962,59 @@ class LibraryService:
                     continue
                 cand_norm = candidate[3]
                 if cand_norm == normalized_query:
-                    matches.append((candidate[0], candidate[1], candidate[2], cand_norm, "exact", 100))
+                    matches.append(
+                        (
+                            candidate[0],
+                            candidate[1],
+                            candidate[2],
+                            cand_norm,
+                            "exact",
+                            100,
+                        )
+                    )
                 elif cand_norm.startswith(normalized_query):
-                    matches.append((candidate[0], candidate[1], candidate[2], cand_norm, "prefix", 95))
+                    matches.append(
+                        (
+                            candidate[0],
+                            candidate[1],
+                            candidate[2],
+                            cand_norm,
+                            "prefix",
+                            95,
+                        )
+                    )
                 elif normalized_query in cand_norm:
-                    matches.append((candidate[0], candidate[1], candidate[2], cand_norm, "substring", 90))
-                elif _HAS_RAPIDFUZZ and len(normalized_query) >= 3:
+                    matches.append(
+                        (
+                            candidate[0],
+                            candidate[1],
+                            candidate[2],
+                            cand_norm,
+                            "substring",
+                            90,
+                        )
+                    )
+                elif include_fuzzy and _HAS_RAPIDFUZZ and len(normalized_query) >= 3:
                     score = fuzz.WRatio(normalized_query, cand_norm)
                     if score >= 68.0:
-                        matches.append((candidate[0], candidate[1], candidate[2], cand_norm, "fuzzy", score))
+                        matches.append(
+                            (
+                                candidate[0],
+                                candidate[1],
+                                candidate[2],
+                                cand_norm,
+                                "fuzzy",
+                                score,
+                            )
+                        )
 
             if normalized_query and not matches:
                 continue
 
             def match_rank(item):
-                kind_idx = {"exact": 0, "prefix": 1, "substring": 2, "fuzzy": 3}[item[4]]
+                kind_idx = {"exact": 0, "prefix": 1, "substring": 2, "fuzzy": 3}[
+                    item[4]
+                ]
                 field_priority = item[0]
                 is_title_or_alias = field_priority < 2
                 is_filename = field_priority == 6
@@ -979,7 +1091,8 @@ class LibraryService:
                     "version_sort_order": row["version_sort_order"],
                     "version_notes": row["version_notes"] or "",
                     "version_terms": row["version_distribution_terms"] or "",
-                    "is_preferred_version": row["version_id"] == row["preferred_version_id"],
+                    "is_preferred_version": row["version_id"]
+                    == row["preferred_version_id"],
                     "is_default_file": row["file_id"] == row["version_default_file_id"],
                     "path": row["locator"],
                     "locator": row["locator"],
@@ -1028,6 +1141,8 @@ class LibraryService:
             project["health"] = (
                 next(iter(health_values)) if len(health_values) == 1 else "mixed"
             )
+            if requested_project_id is not None:
+                project["versions"] = self.list_versions(project["id"])
         return output
 
     @staticmethod
@@ -1051,12 +1166,12 @@ class LibraryService:
 
         result = {
             row["id"]: empty_metadata()
-            for row in connection.execute("SELECT id FROM projects")
+            for row in connection.execute("SELECT id FROM selected_projects")
         }
         aliases = connection.execute(
             """
             SELECT p.id AS project_id, sn.text, sn.normalized_text, sn.source_type
-              FROM projects p JOIN song_names sn ON sn.song_id = p.song_id
+              FROM selected_projects p JOIN song_names sn ON sn.song_id = p.song_id
              WHERE sn.is_dismissed = 0
              ORDER BY p.id, sn.normalized_text, sn.id
             """
@@ -1073,14 +1188,14 @@ class LibraryService:
         credits = connection.execute(
             """
             SELECT p.id AS project_id, c.display_name, c.normalized_name,
-                   pc.role, pc.source_type
-              FROM projects p
+                   pc.role, pc.source_type, 'project' AS scope
+              FROM selected_projects p
               JOIN project_credits pc ON pc.project_id = p.id
               JOIN contributors c ON c.id = pc.contributor_id
             UNION
             SELECT p.id AS project_id, c.display_name, c.normalized_name,
-                   sc.role, sc.source_type
-              FROM projects p
+                   sc.role, sc.source_type, 'song' AS scope
+              FROM selected_projects p
               JOIN song_credits sc ON sc.song_id = p.song_id
               JOIN contributors c ON c.id = sc.contributor_id
              ORDER BY 1, 3, 4
@@ -1091,7 +1206,12 @@ class LibraryService:
             credit_str = f"{item['display_name']} ({item['role']})"
             if credit_str not in data["credits"]:
                 data["credits"].append(credit_str)
-            record = {"name": item["display_name"], "role": item["role"]}
+            record = {
+                "name": item["display_name"],
+                "role": item["role"],
+                "scope": item["scope"],
+                "source": item["source_type"],
+            }
             if record not in data["credit_records"]:
                 data["credit_records"].append(record)
             if item["normalized_name"] not in data["normalized_credits"]:
@@ -1102,19 +1222,22 @@ class LibraryService:
         contributor_aliases = connection.execute(
             """
             SELECT pc.project_id, cn.normalized_text
-              FROM project_credits pc
+              FROM project_credits pc JOIN selected_projects sp ON sp.id = pc.project_id
               JOIN contributor_names cn ON cn.contributor_id = pc.contributor_id
              WHERE cn.is_dismissed = 0
             UNION
             SELECT p.id AS project_id, cn.normalized_text
-              FROM projects p
+              FROM selected_projects p
               JOIN song_credits sc ON sc.song_id = p.song_id
               JOIN contributor_names cn ON cn.contributor_id = sc.contributor_id
              WHERE cn.is_dismissed = 0
             """
         ).fetchall()
         for item in contributor_aliases:
-            if item["normalized_text"] not in result[item["project_id"]]["normalized_credits"]:
+            if (
+                item["normalized_text"]
+                not in result[item["project_id"]]["normalized_credits"]
+            ):
                 result[item["project_id"]]["normalized_credits"].append(
                     item["normalized_text"]
                 )
@@ -1122,11 +1245,11 @@ class LibraryService:
         links = connection.execute(
             """
             SELECT p.id AS project_id, sl.kind, sl.url, sl.label
-              FROM projects p
+              FROM selected_projects p
               JOIN song_links sl ON sl.song_id = p.song_id
             UNION
             SELECT pl.project_id, pl.kind, pl.url, pl.label
-              FROM project_links pl
+              FROM project_links pl JOIN selected_projects sp ON sp.id = pl.project_id
              ORDER BY 1, 4, 3
             """
         ).fetchall()
@@ -1143,7 +1266,7 @@ class LibraryService:
         tags = connection.execute(
             """
             SELECT pt.project_id, t.name, t.normalized_name
-              FROM project_tags pt JOIN tags t ON t.id = pt.tag_id
+              FROM project_tags pt JOIN selected_projects sp ON sp.id = pt.project_id JOIN tags t ON t.id = pt.tag_id
              ORDER BY pt.project_id, t.normalized_name, t.id
             """
         ).fetchall()
@@ -1745,14 +1868,47 @@ class LibraryService:
                   JOIN files f ON f.id = po.file_id
                   JOIN versions v ON v.id = f.version_id
                  WHERE ft.voice_name IS NOT NULL AND ft.voice_name != ''
+                   AND po.id = (SELECT id FROM parse_observations WHERE file_id = f.id
+                                ORDER BY is_stale ASC, observed_at DESC LIMIT 1)
                 """
             )
-
+            connection.execute("""INSERT INTO search_fts
+                SELECT project_id, id, 'version', label, normalized_label FROM versions""")
+            connection.executemany(
+                "INSERT INTO search_fts VALUES (?, ?, 'filename', ?, ?)",
+                (
+                    (
+                        r[0],
+                        r[1],
+                        Path(r[2]).name,
+                        normalize_search_text(Path(r[2]).name),
+                    )
+                    for r in connection.execute(
+                        "SELECT v.project_id, f.id, f.locator FROM files f JOIN versions v ON v.id=f.version_id"
+                    ).fetchall()
+                ),
+            )
+            voices = connection.execute("""SELECT v.project_id, ft.id, ft.details_json
+                FROM file_tracks ft JOIN parse_observations po ON po.id=ft.observation_id
+                JOIN files f ON f.id=po.file_id JOIN versions v ON v.id=f.version_id
+                WHERE po.id=(SELECT id FROM parse_observations WHERE file_id=f.id
+                             ORDER BY is_stale ASC, observed_at DESC LIMIT 1)""").fetchall()
+            for project_id, track_id, details in voices:
+                for voice in json.loads(details or "{}").get("voices", []):
+                    name = voice.get("name")
+                    if name:
+                        connection.execute(
+                            "INSERT INTO search_fts VALUES (?, ?, 'voice', ?, ?)",
+                            (project_id, track_id, name, normalize_search_text(name)),
+                        )
+            connection.execute("UPDATE search_index_state SET dirty = 0 WHERE id = 1")
+            self._search_vocabulary = load_vocabulary(connection)
 
     def search_vocadb_candidates(
         self, query: str, *, max_results: int = 10
     ) -> list[dict[str, Any]]:
         from .vocadb import VocaDbClient
+
         with self.database.connection() as conn:
             client = VocaDbClient(cache_connection=conn)
             candidates = client.search_songs(query, max_results=max_results)
@@ -1770,11 +1926,14 @@ class LibraryService:
                 for c in candidates
             ]
 
-    def fetch_vocadb_candidate(self, song_id: int) -> dict[str, Any] | None:
+    def fetch_vocadb_candidate(
+        self, song_id: int, *, force_refresh: bool = False
+    ) -> dict[str, Any] | None:
         from .vocadb import VocaDbClient
+
         with self.database.connection() as conn:
             client = VocaDbClient(cache_connection=conn)
-            c = client.get_song(song_id)
+            c = client.get_song(song_id, force_refresh=force_refresh)
             if c is None:
                 return None
             return {
@@ -1840,7 +1999,7 @@ class LibraryService:
                     (vocadb_id, song_id),
                 )
 
-            if overwrite_overrides:
+            if overwrite_overrides and apply_name:
                 connection.execute(
                     "DELETE FROM song_overrides WHERE song_id = ? AND field_name = 'display_name'",
                     (song_id,),
@@ -1863,7 +2022,12 @@ class LibraryService:
                     if disp is not None:
                         connection.execute(
                             "UPDATE song_names SET text = ?, normalized_text = ?, source_type = 'vocadb', source_identifier = ? WHERE id = ?",
-                            (cand_name, normalize_search_text(cand_name), str(vocadb_id), disp[0]),
+                            (
+                                cand_name,
+                                normalize_search_text(cand_name),
+                                str(vocadb_id),
+                                disp[0],
+                            ),
                         )
                     else:
                         connection.execute(
@@ -1871,16 +2035,22 @@ class LibraryService:
                             INSERT INTO song_names(id, song_id, text, normalized_text, is_display, kind, source_type, source_identifier)
                             VALUES (?, ?, ?, ?, 1, 'primary', 'vocadb', ?)
                             """,
-                            (new_id(), song_id, cand_name, normalize_search_text(cand_name), str(vocadb_id)),
+                            (
+                                new_id(),
+                                song_id,
+                                cand_name,
+                                normalize_search_text(cand_name),
+                                str(vocadb_id),
+                            ),
                         )
                     connection.execute(
                         """
                         UPDATE projects
                            SET name = ?, normalized_name = ?,
                                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                         WHERE song_id = ?
+                         WHERE id = ?
                         """,
-                        (cand_name, normalize_search_text(cand_name), song_id),
+                        (cand_name, normalize_search_text(cand_name), project_id),
                     )
 
             if apply_aliases:
@@ -1900,14 +2070,16 @@ class LibraryService:
                             INSERT INTO song_names(id, song_id, text, normalized_text, language, kind, source_type, source_identifier, is_display)
                             VALUES (?, ?, ?, ?, ?, 'alias', 'vocadb', ?, 0)
                             """,
-                            (new_id(), song_id, alias_val, norm_val, n.get("language"), str(vocadb_id)),
+                            (
+                                new_id(),
+                                song_id,
+                                alias_val,
+                                norm_val,
+                                n.get("language"),
+                                str(vocadb_id),
+                            ),
                         )
                         existing_aliases.add(norm_val)
-                    elif alias_val and norm_val in existing_aliases and overwrite_overrides:
-                        connection.execute(
-                            "UPDATE song_names SET is_dismissed = 0 WHERE song_id = ? AND normalized_text = ?",
-                            (song_id, norm_val),
-                        )
 
             if apply_credits:
                 existing_credits = {
@@ -1927,7 +2099,9 @@ class LibraryService:
                     if not art_name:
                         continue
                     norm_art = normalize_search_text(art_name)
-                    role = str(art.get("roles") or art.get("categories") or "Music").strip()
+                    role = str(
+                        art.get("roles") or art.get("categories") or "Music"
+                    ).strip()
                     if (norm_art, role) in existing_credits:
                         continue
 
@@ -1969,7 +2143,13 @@ class LibraryService:
                             INSERT INTO song_links(id, song_id, kind, url, label)
                             VALUES (?, ?, ?, ?, ?)
                             """,
-                            (new_id(), song_id, link.get("kind", "web"), url, link.get("label", "Link")),
+                            (
+                                new_id(),
+                                song_id,
+                                link.get("kind", "web"),
+                                url,
+                                link.get("label", "Link"),
+                            ),
                         )
                         existing_urls.add(url)
 
@@ -1988,8 +2168,7 @@ class LibraryService:
                     (row[0],),
                 )
 
-    @_serialized_write
-    def refresh_vocadb(self, project_id: str) -> dict[str, Any]:
+    def preview_vocadb_refresh(self, project_id: str) -> dict[str, Any]:
         with self.database.connection() as connection:
             row = connection.execute(
                 """
@@ -2004,13 +2183,16 @@ class LibraryService:
                 raise LibraryError("Project is not linked to a VocaDB entry.")
             vocadb_id = row[0]
 
-        candidate = self.fetch_vocadb_candidate(vocadb_id)
+        candidate = self.fetch_vocadb_candidate(vocadb_id, force_refresh=True)
         if candidate is None:
             raise LibraryError(f"VocaDB entry #{vocadb_id} could not be retrieved.")
+        return candidate
+
+    def refresh_vocadb(self, project_id: str) -> dict[str, Any]:
+        candidate = self.preview_vocadb_refresh(project_id)
         return self.apply_vocadb_enrichment(
             project_id, candidate, overwrite_overrides=False
         )
-
 
     @_serialized_write
     def create_version(
@@ -2106,7 +2288,11 @@ class LibraryService:
             if not new_label:
                 raise LibraryError("Version label cannot be empty.")
             new_notes = ver["notes"] if notes is None else notes
-            new_terms = ver["distribution_terms"] if distribution_terms is None else distribution_terms
+            new_terms = (
+                ver["distribution_terms"]
+                if distribution_terms is None
+                else distribution_terms
+            )
 
             connection.execute(
                 """
@@ -2115,7 +2301,13 @@ class LibraryService:
                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                  WHERE id = ?
                 """,
-                (new_label, normalize_search_text(new_label), new_notes, new_terms, version_id),
+                (
+                    new_label,
+                    normalize_search_text(new_label),
+                    new_notes,
+                    new_terms,
+                    version_id,
+                ),
             )
             return {
                 "id": version_id,
@@ -2203,7 +2395,9 @@ class LibraryService:
                 (target_version_id,),
             ).fetchone()
             if target_row is None:
-                raise LibraryError(f"Target version {target_version_id} does not exist.")
+                raise LibraryError(
+                    f"Target version {target_version_id} does not exist."
+                )
 
             old_version = connection.execute(
                 "SELECT default_file_id FROM versions WHERE id = ?", (old_version_id,)
@@ -2248,7 +2442,9 @@ class LibraryService:
                 (target_project_id,),
             ).fetchone()
             if target_proj is None:
-                raise LibraryError(f"Target project {target_project_id} does not exist.")
+                raise LibraryError(
+                    f"Target project {target_project_id} does not exist."
+                )
 
             old_proj = connection.execute(
                 "SELECT preferred_version_id FROM projects WHERE id = ?",
@@ -2283,19 +2479,52 @@ class LibraryService:
                 )
         self.rebuild_search_index()
 
+    def list_grouping_candidates(
+        self, excluded_project_id: str
+    ) -> list[dict[str, Any]]:
+        with self.database.connection(readonly=True) as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT p.id, p.name, COUNT(f.id) AS file_count FROM projects p
+                   LEFT JOIN versions v ON v.project_id=p.id
+                   LEFT JOIN files f ON f.version_id=v.id WHERE p.id != ?
+                   GROUP BY p.id ORDER BY p.name COLLATE NOCASE""",
+                    (excluded_project_id,),
+                )
+            ]
+
     @_serialized_write
     def group_projects(self, source_project_id: str, target_project_id: str) -> None:
         if source_project_id == target_project_id:
             return
         with self.database.connection() as connection, transaction(connection):
             src = connection.execute(
-                "SELECT id, song_id, description FROM projects WHERE id = ?", (source_project_id,)
+                "SELECT id, song_id, description FROM projects WHERE id = ?",
+                (source_project_id,),
             ).fetchone()
             tgt = connection.execute(
-                "SELECT id, song_id, description FROM projects WHERE id = ?", (target_project_id,)
+                "SELECT id, song_id, description FROM projects WHERE id = ?",
+                (target_project_id,),
             ).fetchone()
             if not src or not tgt:
                 raise LibraryError("Source or target project does not exist.")
+
+            # Validate before any reparenting; never silently discard a conflict.
+            for field, value, cleared in connection.execute(
+                "SELECT field_name, value_text, intentionally_cleared FROM project_overrides WHERE project_id = ?",
+                (source_project_id,),
+            ):
+                existing = connection.execute(
+                    "SELECT value_text, intentionally_cleared FROM project_overrides WHERE project_id = ? AND field_name = ?",
+                    (target_project_id, field),
+                ).fetchone()
+                if existing and tuple(existing) != (value, cleared):
+                    raise LibraryError(
+                        f"Grouping has conflicting project override '{field}'. Resolve it before grouping."
+                    )
+            if src["song_id"] and tgt["song_id"] and src["song_id"] != tgt["song_id"]:
+                self._merge_song_metadata(connection, src["song_id"], tgt["song_id"])
 
             # Unset preferred_version_id on source project before reparenting
             connection.execute(
@@ -2332,6 +2561,14 @@ class LibraryService:
                 connection.execute(
                     "UPDATE projects SET description = ? WHERE id = ?",
                     (src["description"], target_project_id),
+                )
+            elif src["description"] and src["description"] != tgt["description"]:
+                connection.execute(
+                    "UPDATE projects SET description = ? WHERE id = ?",
+                    (
+                        tgt["description"] + "\n\n" + src["description"],
+                        target_project_id,
+                    ),
                 )
 
             connection.execute(
@@ -2371,6 +2608,84 @@ class LibraryService:
 
         self.rebuild_search_index()
 
+    @staticmethod
+    def _merge_song_metadata(
+        connection: sqlite3.Connection, source: str, target: str
+    ) -> None:
+        ids = {
+            r["id"]: r["vocadb_id"]
+            for r in connection.execute(
+                "SELECT id, vocadb_id FROM songs WHERE id IN (?, ?)", (source, target)
+            )
+        }
+        if ids[source] and ids[target] and ids[source] != ids[target]:
+            raise LibraryError(
+                "These projects link to different VocaDB songs. Correct or unlink the conflicting match before grouping."
+            )
+        for field, value, cleared in connection.execute(
+            "SELECT field_name, value_text, intentionally_cleared FROM song_overrides WHERE song_id=?",
+            (source,),
+        ):
+            existing = connection.execute(
+                "SELECT value_text, intentionally_cleared FROM song_overrides WHERE song_id=? AND field_name=?",
+                (target, field),
+            ).fetchone()
+            if existing and tuple(existing) != (value, cleared):
+                raise LibraryError(
+                    f"Grouping has conflicting song override '{field}'. Resolve it before grouping."
+                )
+            connection.execute(
+                "INSERT OR IGNORE INTO song_overrides(song_id, field_name, value_text, intentionally_cleared) VALUES (?,?,?,?)",
+                (target, field, value, cleared),
+            )
+        has_display = bool(
+            connection.execute(
+                "SELECT 1 FROM song_names WHERE song_id=? AND is_display=1", (target,)
+            ).fetchone()
+        )
+        for row in connection.execute(
+            "SELECT * FROM song_names WHERE song_id=?", (source,)
+        ).fetchall():
+            existing = connection.execute(
+                "SELECT id, is_dismissed FROM song_names WHERE song_id=? AND normalized_text=?",
+                (target, row["normalized_text"]),
+            ).fetchone()
+            if existing:
+                if row["is_dismissed"]:
+                    connection.execute(
+                        "UPDATE song_names SET is_dismissed=1 WHERE id=?",
+                        (existing["id"],),
+                    )
+                continue
+            data = dict(row)
+            data.update(
+                id=new_id(),
+                song_id=target,
+                is_display=int(bool(row["is_display"]) and not has_display),
+            )
+            has_display |= bool(data["is_display"])
+            columns = ",".join(data)
+            connection.execute(
+                f"INSERT INTO song_names({columns}) VALUES ({','.join('?' for _ in data)})",
+                tuple(data.values()),
+            )
+        for table in ("song_credits", "song_links"):
+            for row in connection.execute(
+                f"SELECT * FROM {table} WHERE song_id=?", (source,)
+            ).fetchall():
+                data = dict(row)
+                data.update(id=new_id(), song_id=target)
+                connection.execute(
+                    f"INSERT OR IGNORE INTO {table}({','.join(data)}) VALUES ({','.join('?' for _ in data)})",
+                    tuple(data.values()),
+                )
+        # Copy metadata without mutating the song still used by other projects.
+        # A unique remote identity cannot be attached to two local songs.
+        if ids[source] and not ids[target]:
+            raise LibraryError(
+                "The source has a VocaDB song match and the target has separate song metadata. Group into the linked project instead."
+            )
+
     def open_project(
         self, project_id: str, application: str | Path | None = None
     ) -> None:
@@ -2392,13 +2707,16 @@ class LibraryService:
                       JOIN versions v ON v.id = f.version_id
                      WHERE v.project_id = ?
                      ORDER BY v.sort_order, f.role = 'project' DESC
-                     LIMIT 1
                     """,
                     (project_id,),
-                ).fetchone()
+                ).fetchall()
                 if not fallback:
                     raise LibraryError("Project has no files to open.")
-                file_id = fallback[0]
+                if len(fallback) != 1:
+                    raise LibraryError(
+                        "Choose a file in the inspector or set a preferred version and default file."
+                    )
+                file_id = fallback[0][0]
 
         self.open_file(file_id, application)
 
@@ -2444,6 +2762,7 @@ class LibraryService:
     def restore_from(self, source: str | Path) -> None:
         self.database.restore_from(source)
         self.database.initialize()
+        self._search_vocabulary = None
 
 
 __all__ = ["PROJECT_EXTENSIONS", "LibraryError", "LibraryService"]
