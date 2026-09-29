@@ -2018,26 +2018,4 @@ def apply_application_style(app: QApplication) -> None:
     """Apply small cross-platform defaults without imposing a fixed theme."""
     app.setApplicationName("VocaVault")
     app.setOrganizationName("VocaVault")
-    app.setStyleSheet(
-        """
-        QLabel[heading="true"] { font-size: 18px; font-weight: 600; margin-bottom: 2px; }
-        QLineEdit, QComboBox, QPlainTextEdit { padding: 4px; }
-        QTableWidget { border: 0; }
-        QTabWidget::pane { border: 1px solid palette(mid); border-top: none; border-radius: 0 0 4px 4px; }
-        QTabBar::tab { padding: 6px 16px; min-width: 60px; }
-        QTabBar::tab:selected { font-weight: 600; }
-        QGroupBox {
-            font-weight: 600;
-            margin-top: 10px;
-            padding-top: 14px;
-            border: 1px solid palette(mid);
-            border-radius: 4px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            left: 8px;
-            padding: 0 4px 0 4px;
-        }
-        QPushButton { padding: 5px 10px; }
-        """
-    )
+    app.setStyle('Fusion')
