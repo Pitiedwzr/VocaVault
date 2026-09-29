@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -27,13 +28,21 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
+
+SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
+    {".svp", ".ust", ".vsqx", ".ustx", ".vpr", ".ccs", ".ppsf", ".mid"}
+)
+
 
 
 def _value(source: Any, *names: str, default: Any = None) -> Any:
@@ -569,6 +578,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("VocaVault")
         self.resize(1280, 760)
         self.setMinimumSize(900, 560)
+        self.setAcceptDrops(True)
 
         self._create_actions()
         self._create_toolbar()
@@ -675,13 +685,8 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.import_folder_action)
         toolbar.addSeparator()
         toolbar.addAction(self.open_action)
-        toolbar.addAction(self.open_with_action)
         toolbar.addAction(self.reveal_action)
         toolbar.addAction(self.refresh_action)
-        toolbar.addAction(self.relink_action)
-        toolbar.addSeparator()
-        toolbar.addAction(self.group_project_action)
-        toolbar.addAction(self.enrich_vocadb_action)
         self.addToolBar(toolbar)
 
     def _create_panels(self) -> None:
@@ -692,7 +697,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([220, 700, 320])
+        splitter.setSizes([210, 680, 390])
         self.setCentralWidget(splitter)
 
     def _navigation_panel(self) -> QWidget:
@@ -701,12 +706,19 @@ class MainWindow(QMainWindow):
         panel.setMinimumWidth(185)
         panel.setMaximumWidth(300)
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(4)
 
         heading = QLabel("Library", panel)
         heading.setProperty("heading", True)
         layout.addWidget(heading)
 
-        layout.addWidget(QLabel("Engine", panel))
+        def add_filter_label(text: str) -> None:
+            lbl = QLabel(text, panel)
+            lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: palette(mid); margin-top: 5px;")
+            layout.addWidget(lbl)
+
+        add_filter_label("Engine")
         self.engine_filter = QComboBox(panel)
         self.engine_filter.addItem("All engines", None)
         self.engine_filter.addItem("Synthesizer V", "svp")
@@ -714,7 +726,7 @@ class MainWindow(QMainWindow):
         self.engine_filter.addItem("Vocaloid", "vsqx")
         layout.addWidget(self.engine_filter)
 
-        layout.addWidget(QLabel("Language", panel))
+        add_filter_label("Language")
         self.language_filter = QComboBox(panel)
         self.language_filter.addItem("All languages", None)
         for label, value in (
@@ -726,13 +738,13 @@ class MainWindow(QMainWindow):
             self.language_filter.addItem(label, value)
         layout.addWidget(self.language_filter)
 
-        layout.addWidget(QLabel("Voice", panel))
+        add_filter_label("Voice")
         self.voice_filter = QLineEdit(panel)
         self.voice_filter.setPlaceholderText("Any voice")
         self.voice_filter.setClearButtonEnabled(True)
         layout.addWidget(self.voice_filter)
 
-        layout.addWidget(QLabel("Tuning signals", panel))
+        add_filter_label("Tuning signals")
         self.tuning_filter = QComboBox(panel)
         self.tuning_filter.addItem("Any state", None)
         self.tuning_filter.addItem("Detected", "detected")
@@ -740,13 +752,13 @@ class MainWindow(QMainWindow):
         self.tuning_filter.addItem("Unknown", "unknown")
         layout.addWidget(self.tuning_filter)
 
-        layout.addWidget(QLabel("Versions", panel))
+        add_filter_label("Versions")
         self.version_scope = QComboBox(panel)
         self.version_scope.addItem("All versions", "all")
         self.version_scope.addItem("Preferred version", "preferred")
         layout.addWidget(self.version_scope)
 
-        layout.addWidget(QLabel("Health", panel))
+        add_filter_label("Health")
         self.health_filter = QComboBox(panel)
         self.health_filter.addItem("All files", None)
         self.health_filter.addItem("Available", "available")
@@ -757,13 +769,17 @@ class MainWindow(QMainWindow):
         self.health_filter.addItem("Unsupported", "unsupported")
         layout.addWidget(self.health_filter)
 
+        self.reset_filters_button = QPushButton("Reset Filters", panel)
+        self.reset_filters_button.clicked.connect(self.clear_filters)
+        layout.addWidget(self.reset_filters_button)
+
         layout.addStretch(1)
         hint = QLabel(
             "Files stay in their current locations. Importing indexes them without changing source bytes.",
             panel,
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: palette(mid);")
+        hint.setStyleSheet("color: palette(mid); font-size: 11px;")
         layout.addWidget(hint)
         return panel
 
@@ -771,6 +787,7 @@ class MainWindow(QMainWindow):
         panel = QWidget(self)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         self.search_edit = QLineEdit(panel)
         self.search_edit.setPlaceholderText(
@@ -779,7 +796,11 @@ class MainWindow(QMainWindow):
         self.search_edit.setClearButtonEnabled(True)
         layout.addWidget(self.search_edit)
 
-        self.project_table = ProjectTableWidget(0, len(self.TABLE_COLUMNS), self._project_file_for_row, panel)
+        self.table_stack = QStackedWidget(panel)
+
+        self.project_table = ProjectTableWidget(
+            0, len(self.TABLE_COLUMNS), self._project_file_for_row, self.table_stack
+        )
         self.project_table.setHorizontalHeaderLabels(self.TABLE_COLUMNS)
         self.project_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -796,31 +817,86 @@ class MainWindow(QMainWindow):
         for column in range(1, len(self.TABLE_COLUMNS)):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.project_table.doubleClicked.connect(self.open_selected_file)
-        layout.addWidget(self.project_table, 1)
+        self.table_stack.addWidget(self.project_table)
+
+        self.empty_state_frame = QFrame(self.table_stack)
+        empty_layout = QVBoxLayout(self.empty_state_frame)
+        empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.setSpacing(8)
+
+        self.empty_state_title = QLabel("No projects found", self.empty_state_frame)
+        self.empty_state_title.setStyleSheet(
+            "font-size: 15px; font-weight: 600; color: palette(text);"
+        )
+        self.empty_state_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(self.empty_state_title)
+
+        self.empty_state_desc = QLabel("", self.empty_state_frame)
+        self.empty_state_desc.setStyleSheet("color: palette(mid); font-size: 12px;")
+        self.empty_state_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_state_desc.setWordWrap(True)
+        empty_layout.addWidget(self.empty_state_desc)
+
+        self.empty_state_action = QPushButton("Reset Filters", self.empty_state_frame)
+        self.empty_state_action.setMaximumWidth(160)
+        self.empty_state_action.clicked.connect(self._on_empty_state_action)
+        empty_layout.addWidget(
+            self.empty_state_action, alignment=Qt.AlignmentFlag.AlignCenter
+        )
+
+        self.table_stack.addWidget(self.empty_state_frame)
+        layout.addWidget(self.table_stack, 1)
         return panel
 
     def _inspector_panel(self) -> QWidget:
         panel = QFrame(self)
         panel.setFrameShape(QFrame.Shape.StyledPanel)
-        panel.setMinimumWidth(270)
-        panel.setMaximumWidth(440)
+        panel.setMinimumWidth(280)
+        panel.setMaximumWidth(460)
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
 
-        layout.addWidget(QLabel("Inspector", panel))
+        header_layout = QHBoxLayout()
+        heading = QLabel("Inspector", panel)
+        heading.setProperty("heading", True)
+        header_layout.addWidget(heading)
+        layout.addLayout(header_layout)
+
+        self.inspector_tabs = QTabWidget(panel)
+        self.inspector_tabs.addTab(self._metadata_tab(self.inspector_tabs), "Metadata")
+        self.inspector_tabs.addTab(
+            self._versions_files_tab(self.inspector_tabs), "Versions & Files"
+        )
+        layout.addWidget(self.inspector_tabs)
+        return panel
+
+    def _metadata_tab(self, parent: QWidget) -> QWidget:
+        scroll = QScrollArea(parent)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        content = QWidget(scroll)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
         form = QFormLayout()
-        self.name_edit = QLineEdit(panel)
-        self.description_edit = QPlainTextEdit(panel)
-        self.description_edit.setMaximumHeight(100)
-        self.status_edit = QLineEdit(panel)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.name_edit = QLineEdit(content)
+        self.description_edit = QPlainTextEdit(content)
+        self.description_edit.setMaximumHeight(80)
+        self.status_edit = QLineEdit(content)
         self.status_edit.setPlaceholderText("Workflow status")
-        self.aliases_edit = QPlainTextEdit(panel)
-        self.aliases_edit.setMaximumHeight(80)
+        self.aliases_edit = QPlainTextEdit(content)
+        self.aliases_edit.setMaximumHeight(60)
         self.aliases_edit.setPlaceholderText("One song alias per line")
-        self.credits_edit = QPlainTextEdit(panel)
-        self.credits_edit.setMaximumHeight(90)
+        self.credits_edit = QPlainTextEdit(content)
+        self.credits_edit.setMaximumHeight(70)
         self.credits_edit.setPlaceholderText("One credit per line: role: contributor")
-        self.tags_edit = QLineEdit(panel)
+        self.tags_edit = QLineEdit(content)
         self.tags_edit.setPlaceholderText("Comma-separated tags")
+
         form.addRow("Project", self.name_edit)
         form.addRow("Description", self.description_edit)
         form.addRow("Status", self.status_edit)
@@ -830,112 +906,153 @@ class MainWindow(QMainWindow):
         layout.addLayout(form)
 
         proj_btn_row = QHBoxLayout()
-        self.save_button = QPushButton("Save Project", panel)
+        self.save_button = QPushButton("Save Project", content)
         self.save_button.clicked.connect(self.save_project)
-        self.group_project_button = QPushButton("Group into…", panel)
+        self.group_project_button = QPushButton("Group into…", content)
         self.group_project_button.clicked.connect(self.group_selected_project)
         proj_btn_row.addWidget(self.save_button)
         proj_btn_row.addWidget(self.group_project_button)
         layout.addLayout(proj_btn_row)
 
-        vocadb_box = QHBoxLayout()
-        self.vocadb_button = QPushButton("Enrich from VocaDB…", panel)
+        vocadb_group = QGroupBox("VocaDB Enrichment", content)
+        vocadb_layout = QVBoxLayout(vocadb_group)
+        vocadb_layout.setSpacing(6)
+
+        self.vocadb_button = QPushButton("Enrich from VocaDB…", vocadb_group)
         self.vocadb_button.clicked.connect(self.enrich_selected_with_vocadb)
-        self.vocadb_refresh_button = QPushButton("Refresh", panel)
+        vocadb_layout.addWidget(self.vocadb_button)
+
+        vocadb_sub_row = QHBoxLayout()
+        self.vocadb_refresh_button = QPushButton("Refresh", vocadb_group)
         self.vocadb_refresh_button.clicked.connect(self.refresh_selected_vocadb)
-        self.vocadb_unlink_button = QPushButton("Unlink", panel)
+        self.vocadb_unlink_button = QPushButton("Unlink", vocadb_group)
         self.vocadb_unlink_button.clicked.connect(self.unlink_selected_vocadb)
-        vocadb_box.addWidget(self.vocadb_button)
-        vocadb_box.addWidget(self.vocadb_refresh_button)
-        vocadb_box.addWidget(self.vocadb_unlink_button)
-        layout.addLayout(vocadb_box)
-        self.vocadb_status = QLabel(panel)
+        vocadb_sub_row.addWidget(self.vocadb_refresh_button)
+        vocadb_sub_row.addWidget(self.vocadb_unlink_button)
+        vocadb_layout.addLayout(vocadb_sub_row)
+
+        self.vocadb_status = QLabel(vocadb_group)
         self.vocadb_status.setStyleSheet("color: palette(mid); font-size: 11px;")
-        layout.addWidget(self.vocadb_status)
+        vocadb_layout.addWidget(self.vocadb_status)
+        layout.addWidget(vocadb_group)
 
-        line = QFrame(panel)
-        line.setFrameShape(QFrame.Shape.HLine)
-        layout.addWidget(line)
+        layout.addStretch(1)
+        scroll.setWidget(content)
+        return scroll
 
-        layout.addWidget(QLabel("Versions", panel))
+    def _versions_files_tab(self, parent: QWidget) -> QWidget:
+        scroll = QScrollArea(parent)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        content = QWidget(scroll)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
+        # Versions section
+        ver_group = QGroupBox("Version Management", content)
+        ver_layout = QVBoxLayout(ver_group)
+        ver_layout.setSpacing(6)
+
         ver_row = QHBoxLayout()
-        self.version_combo = QComboBox(panel)
+        self.version_combo = QComboBox(ver_group)
         self.version_combo.currentIndexChanged.connect(self._on_version_selected)
-        self.new_version_button = QPushButton("+ Version…", panel)
+        self.new_version_button = QPushButton("+ Version…", ver_group)
         self.new_version_button.clicked.connect(self.create_new_version)
         ver_row.addWidget(self.version_combo, 1)
         ver_row.addWidget(self.new_version_button)
-        layout.addLayout(ver_row)
+        ver_layout.addLayout(ver_row)
+
+        ver_form = QFormLayout()
+        ver_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        self.version_terms_edit = QLineEdit(ver_group)
+        self.version_terms_edit.setPlaceholderText("Distribution terms (e.g. CC-BY)")
+        self.version_notes_edit = QLineEdit(ver_group)
+        self.version_notes_edit.setPlaceholderText("Version notes")
+        ver_form.addRow("Terms", self.version_terms_edit)
+        ver_form.addRow("Notes", self.version_notes_edit)
+        ver_layout.addLayout(ver_form)
 
         ver_act_row = QHBoxLayout()
-        self.set_preferred_button = QPushButton("Set as Preferred", panel)
+        self.set_preferred_button = QPushButton("Set as Preferred", ver_group)
         self.set_preferred_button.clicked.connect(self.set_selected_preferred_version)
-        self.save_version_button = QPushButton("Save Version", panel)
+        self.save_version_button = QPushButton("Save Version", ver_group)
         self.save_version_button.clicked.connect(self.save_selected_version)
         ver_act_row.addWidget(self.set_preferred_button)
         ver_act_row.addWidget(self.save_version_button)
-        layout.addLayout(ver_act_row)
+        ver_layout.addLayout(ver_act_row)
+        layout.addWidget(ver_group)
 
-        self.version_terms_edit = QLineEdit(panel)
-        self.version_terms_edit.setPlaceholderText("Distribution terms (e.g. CC-BY)")
-        layout.addWidget(self.version_terms_edit)
-        self.version_notes_edit = QLineEdit(panel)
-        self.version_notes_edit.setPlaceholderText("Version notes")
-        layout.addWidget(self.version_notes_edit)
+        # Files section
+        file_group = QGroupBox("Files", content)
+        file_layout = QVBoxLayout(file_group)
+        file_layout.setSpacing(6)
 
-        line2 = QFrame(panel)
-        line2.setFrameShape(QFrame.Shape.HLine)
-        layout.addWidget(line2)
-
-        layout.addWidget(QLabel("Files", panel))
-        self.file_combo = QComboBox(panel)
-        layout.addWidget(self.file_combo)
+        self.file_combo = QComboBox(file_group)
+        file_layout.addWidget(self.file_combo)
 
         file_act_row = QHBoxLayout()
-        self.set_default_file_button = QPushButton("Set as Default", panel)
+        self.set_default_file_button = QPushButton("Set as Default", file_group)
         self.set_default_file_button.clicked.connect(self.set_selected_default_file)
-        self.move_to_version_button = QPushButton("Move to Version…", panel)
+        self.move_to_version_button = QPushButton("Move to Version…", file_group)
         self.move_to_version_button.clicked.connect(self.move_selected_file_to_version)
         file_act_row.addWidget(self.set_default_file_button)
         file_act_row.addWidget(self.move_to_version_button)
-        layout.addLayout(file_act_row)
+        file_layout.addLayout(file_act_row)
 
-        self.file_details = QLabel("Select a project to inspect its files.", panel)
+        self.file_details = QLabel(
+            "Select a project to inspect its files.", file_group
+        )
         self.file_details.setWordWrap(True)
         self.file_details.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        layout.addWidget(self.file_details)
+        self.file_details.setStyleSheet(
+            "padding: 4px; background: palette(alternate-base); border-radius: 4px; font-size: 11px;"
+        )
+        file_layout.addWidget(self.file_details)
 
-        button_row = QHBoxLayout()
-        open_button = QPushButton("Open", panel)
+        btn_row_1 = QHBoxLayout()
+        open_button = QPushButton("Open", file_group)
         open_button.clicked.connect(self.open_selected_file)
-        reveal_button = QPushButton("Reveal", panel)
+        reveal_button = QPushButton("Reveal", file_group)
         reveal_button.clicked.connect(self.reveal_selected_file)
-        self.refresh_button = QPushButton("Refresh", panel)
+        btn_row_1.addWidget(open_button)
+        btn_row_1.addWidget(reveal_button)
+        file_layout.addLayout(btn_row_1)
+
+        btn_row_2 = QHBoxLayout()
+        self.refresh_button = QPushButton("Refresh", file_group)
         self.refresh_button.clicked.connect(self.refresh_selected_file)
-        self.relink_button = QPushButton("Relink…", panel)
+        self.relink_button = QPushButton("Relink…", file_group)
         self.relink_button.clicked.connect(self.relink_selected_file)
-        button_row.addWidget(open_button)
-        button_row.addWidget(reveal_button)
-        button_row.addWidget(self.refresh_button)
-        button_row.addWidget(self.relink_button)
-        layout.addLayout(button_row)
+        btn_row_2.addWidget(self.refresh_button)
+        btn_row_2.addWidget(self.relink_button)
+        file_layout.addLayout(btn_row_2)
 
         self.drag_label = DraggableFileLabel(
             lambda: _value(self._selected_file(), "path", "locator"),
-            panel,
+            file_group,
         )
-        layout.addWidget(self.drag_label)
+        file_layout.addWidget(self.drag_label)
+        layout.addWidget(file_group)
 
-        self.metadata_details = QLabel(panel)
+        self.metadata_details = QLabel(content)
         self.metadata_details.setWordWrap(True)
         self.metadata_details.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
+        self.metadata_details.setStyleSheet(
+            "color: palette(mid); font-size: 11px; padding: 4px;"
+        )
         layout.addWidget(self.metadata_details)
+
         layout.addStretch(1)
-        return panel
+        scroll.setWidget(content)
+        return scroll
 
     def _create_status_bar(self) -> None:
         self.progress = QProgressBar(self)
@@ -1157,12 +1274,63 @@ class MainWindow(QMainWindow):
                 self.project_table.setItem(row_index, column, item)
 
         self.project_table.setSortingEnabled(True)
-        if target_selection and self._select_project_id(target_selection):
-            return
         if projects:
+            self.table_stack.setCurrentIndex(0)
+            if target_selection and self._select_project_id(target_selection):
+                return
             self.project_table.selectRow(0)
         else:
+            self.table_stack.setCurrentIndex(1)
+            self._update_empty_state_text()
             self._clear_inspector()
+
+    def _has_active_filters(self) -> bool:
+        return bool(
+            self.search_edit.text().strip()
+            or self._filter_value(self.engine_filter)
+            or self._filter_value(self.language_filter)
+            or self.voice_filter.text().strip()
+            or self._filter_value(self.tuning_filter)
+            or self._filter_value(self.health_filter)
+            or (
+                self._filter_value(self.version_scope)
+                and self._filter_value(self.version_scope) != "all"
+            )
+        )
+
+    def _update_empty_state_text(self) -> None:
+        if self._has_active_filters():
+            self.empty_state_title.setText("No Matching Projects")
+            self.empty_state_desc.setText(
+                "No projects match the current search query or active filters.\n"
+                "Try clearing your search or resetting filters."
+            )
+            self.empty_state_action.setText("Reset Filters")
+        else:
+            self.empty_state_title.setText("Library is Empty")
+            self.empty_state_desc.setText(
+                "No project files indexed yet.\n"
+                "Drag and drop files here, or click below to import."
+            )
+            self.empty_state_action.setText("Import Files…")
+
+    @Slot()
+    def _on_empty_state_action(self) -> None:
+        if self._has_active_filters():
+            self.clear_filters()
+        else:
+            self.import_files()
+
+    @Slot()
+    def clear_filters(self) -> None:
+        self.search_edit.clear()
+        self.engine_filter.setCurrentIndex(0)
+        self.language_filter.setCurrentIndex(0)
+        self.voice_filter.clear()
+        self.tuning_filter.setCurrentIndex(0)
+        self.version_scope.setCurrentIndex(0)
+        self.health_filter.setCurrentIndex(0)
+        self.reload_projects()
 
     def _project_file_for_row(self, row: int) -> str | None:
         item = self.project_table.item(row, 0)
@@ -1792,6 +1960,39 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Metadata restored", 6000)
         self.reload_projects()
 
+    def dragEnterEvent(self, event: Any) -> None:
+        if event.mimeData().hasUrls():
+            paths = [Path(url.toLocalFile()) for url in event.mimeData().urls()]
+            if any(
+                p.is_dir() or p.suffix.lower() in SUPPORTED_EXTENSIONS for p in paths
+            ):
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def dragMoveEvent(self, event: Any) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: Any) -> None:
+        paths = [
+            Path(url.toLocalFile())
+            for url in event.mimeData().urls()
+            if url.isLocalFile()
+        ]
+        importable = [
+            str(p)
+            for p in paths
+            if p.is_dir() or p.suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
+        if importable:
+            event.acceptProposedAction()
+            self._import_paths(importable)
+        else:
+            event.ignore()
+
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._active_jobs:
             self._closing_when_idle = True
@@ -1819,8 +2020,24 @@ def apply_application_style(app: QApplication) -> None:
     app.setOrganizationName("VocaVault")
     app.setStyleSheet(
         """
-        QLabel[heading="true"] { font-size: 18px; font-weight: 600; }
+        QLabel[heading="true"] { font-size: 18px; font-weight: 600; margin-bottom: 2px; }
         QLineEdit, QComboBox, QPlainTextEdit { padding: 4px; }
         QTableWidget { border: 0; }
+        QTabWidget::pane { border: 1px solid palette(mid); border-top: none; border-radius: 0 0 4px 4px; }
+        QTabBar::tab { padding: 6px 16px; min-width: 60px; }
+        QTabBar::tab:selected { font-weight: 600; }
+        QGroupBox {
+            font-weight: 600;
+            margin-top: 10px;
+            padding-top: 14px;
+            border: 1px solid palette(mid);
+            border-radius: 4px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 8px;
+            padding: 0 4px 0 4px;
+        }
+        QPushButton { padding: 5px 10px; }
         """
     )
